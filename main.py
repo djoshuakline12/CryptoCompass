@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
@@ -6,12 +6,13 @@ import asyncio
 import traceback
 import jwt
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import settings
 from services.social_scraper import SocialScraper
 from services.anomaly_detector import AnomalyDetector
 from services.trader import Trader
+from services.dex_trader import dex_trader
 from database import Database
 
 db = Database()
@@ -19,34 +20,19 @@ scraper = SocialScraper()
 detector = AnomalyDetector(db)
 trader = Trader(db)
 
-# JWT Auth
 security = HTTPBearer(auto_error=False)
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify Supabase JWT token - optional auth"""
-    # If no JWT secret configured, allow all requests
     if not SUPABASE_JWT_SECRET:
         return None
-    
-    # If no token provided, allow request (for backwards compatibility)
     if not credentials:
         return None
-    
     try:
         token = credentials.credentials
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated"
-        )
+        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
         return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(401, "Token expired")
-    except jwt.InvalidTokenError as e:
-        # Log but don't block - allow unauthenticated access
-        print(f"Invalid token: {e}")
+    except:
         return None
 
 async def background_loop():
@@ -70,6 +56,8 @@ async def background_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("🔧 Initializing CDP DEX trader...")
+    await dex_trader.initialize()
     task = asyncio.create_task(background_loop())
     print("🚀 Background trading loop started")
     yield
@@ -88,7 +76,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "running", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "running", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/signals")
 async def get_signals(user=Depends(verify_token)):
@@ -214,7 +202,8 @@ async def get_trading_status(user=Depends(verify_token)):
         "capital_deployed": round(capital_used, 2),
         "capital_available": round(settings.total_portfolio_usd - capital_used, 2),
         "daily_pnl": round(settings.daily_pnl, 2),
-        "daily_loss_limit_hit": settings.is_daily_loss_limit_hit()
+        "daily_loss_limit_hit": settings.is_daily_loss_limit_hit(),
+        "dex_initialized": dex_trader.initialized
     }
 
 @app.get("/health")
@@ -223,8 +212,25 @@ async def get_health():
         "status": "critical" if settings.is_health_critical() else "healthy",
         "last_scan": settings.last_successful_scan.isoformat() if settings.last_successful_scan else None,
         "errors": settings.consecutive_errors,
-        "last_error": settings.last_error
+        "last_error": settings.last_error,
+        "dex_ready": dex_trader.initialized
     }
+
+@app.get("/dex/status")
+async def get_dex_status(user=Depends(verify_token)):
+    if not dex_trader.initialized:
+        return {"initialized": False, "error": "CDP not configured"}
+    try:
+        eth = await dex_trader.get_balance("ETH")
+        usdc = await dex_trader.get_balance("USDC")
+        return {
+            "initialized": True,
+            "wallet_address": dex_trader.account.address_id if dex_trader.account else None,
+            "eth_balance": eth,
+            "usdc_balance": usdc
+        }
+    except Exception as e:
+        return {"initialized": True, "error": str(e)}
 
 @app.get("/blacklist")
 async def get_blacklist(user=Depends(verify_token)):
