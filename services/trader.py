@@ -2,6 +2,7 @@ import aiohttp
 from datetime import datetime, timezone
 from config import settings
 from database import Database
+from services.dex_trader import dex_trader
 
 class Trader:
     def __init__(self, db: Database):
@@ -16,7 +17,7 @@ class Trader:
         return self.session
     
     async def get_token_data(self, coin: str) -> dict:
-        coin = coin.upper()
+        coin = coin.upper().strip()
         
         if coin in self.token_data_cache:
             cached = self.token_data_cache[coin]
@@ -28,7 +29,8 @@ class Trader:
         data = {
             "price": 0, "market_cap": 0, "liquidity": 0, "volume_24h": 0,
             "change_24h": 0, "change_1h": 0, "change_5m": 0,
-            "buys_1h": 0, "sells_1h": 0, "source": "unknown"
+            "buys_1h": 0, "sells_1h": 0, "source": "unknown",
+            "contract_address": None, "chain": None
         }
         
         try:
@@ -44,7 +46,13 @@ class Trader:
                     best_liquidity = 0
                     
                     for pair in pairs:
-                        symbol = pair.get("baseToken", {}).get("symbol", "").upper()
+                        symbol = pair.get("baseToken", {}).get("symbol", "").upper().strip()
+                        chain = pair.get("chainId", "")
+                        
+                        # Only consider Base chain tokens (where our wallet is)
+                        if chain != "base":
+                            continue
+                        
                         if symbol == coin:
                             liq = float(pair.get("liquidity", {}).get("usd") or 0)
                             if liq > best_liquidity:
@@ -63,8 +71,10 @@ class Trader:
                         data["buys_1h"] = txns.get("h1", {}).get("buys", 0)
                         data["sells_1h"] = txns.get("h1", {}).get("sells", 0)
                         data["source"] = "dexscreener"
-        except:
-            pass
+                        data["contract_address"] = best_pair.get("baseToken", {}).get("address")
+                        data["chain"] = best_pair.get("chainId")
+        except Exception as e:
+            print(f"Token data error for {coin}: {e}")
         
         self.token_data_cache[coin] = {"data": data, "timestamp": datetime.now(timezone.utc)}
         return data
@@ -78,6 +88,8 @@ class Trader:
         
         if data["price"] == 0:
             return False, "No price data"
+        if data["contract_address"] is None:
+            return False, "No Base token found"
         if data["liquidity"] < settings.min_liquidity:
             return False, f"Low liquidity ${data['liquidity']:,.0f}"
         if data["volume_24h"] < settings.min_volume_24h:
@@ -156,7 +168,7 @@ class Trader:
         available = settings.total_portfolio_usd - used
         
         for signal in signals[:10]:
-            coin = signal["coin"].upper()
+            coin = signal["coin"].upper().strip()
             
             if settings.is_coin_blacklisted(coin):
                 continue
@@ -172,6 +184,7 @@ class Trader:
             
             data = await self.get_token_data(coin)
             price = data["price"]
+            contract = data["contract_address"]
             
             risk = self.calculate_risk_score(signal, data)
             position_usd = min(risk["recommended_position_usd"], available)
@@ -179,9 +192,20 @@ class Trader:
             if position_usd < settings.min_position_usd:
                 continue
             
-            quantity = position_usd / price
+            # Execute real swap if live trading enabled
+            if settings.live_trading and dex_trader.initialized:
+                print(f"🔄 LIVE BUY: ${position_usd:.2f} of {coin} ({contract})")
+                result = await dex_trader.swap_usdc_to_token(contract, position_usd)
+                
+                if not result["success"]:
+                    print(f"❌ Swap failed: {result['error']}")
+                    continue
+                
+                print(f"✅ Swap success: {result}")
+            else:
+                print(f"📝 PAPER BUY: {coin} @ ${price:.6f}")
             
-            print(f"📝 BUY: {quantity:.4f} {coin} @ ${price:.6f}")
+            quantity = position_usd / price
             
             await self.db.open_position({
                 "coin": coin,
@@ -190,6 +214,7 @@ class Trader:
                 "position_usd": position_usd,
                 "market_cap": data["market_cap"],
                 "risk_score": risk["risk_score"],
+                "contract_address": contract,
                 "signal": signal
             })
             
@@ -204,6 +229,7 @@ class Trader:
             coin = pos["coin"]
             buy_price = pos["buy_price"]
             quantity = pos["quantity"]
+            contract = pos.get("contract_address")
             
             current_price = await self.get_current_price(coin)
             if current_price == 0:
@@ -214,7 +240,19 @@ class Trader:
             decision = await self.should_smart_sell(pos, current_price, pnl_percent)
             
             if decision["should_sell"]:
-                print(f"📝 SELL: {coin} @ {pnl_percent:+.1f}% - {decision['reason']}")
+                # Execute real swap if live trading enabled
+                if settings.live_trading and dex_trader.initialized and contract:
+                    print(f"🔄 LIVE SELL: {coin} @ {pnl_percent:+.1f}% ({contract})")
+                    result = await dex_trader.swap_token_to_usdc(contract)
+                    
+                    if not result["success"]:
+                        print(f"❌ Sell failed: {result['error']}")
+                        continue
+                    
+                    print(f"✅ Sell success: {result}")
+                else:
+                    print(f"📝 PAPER SELL: {coin} @ {pnl_percent:+.1f}% - {decision['reason']}")
+                
                 await self.db.close_position(coin, current_price, decision["reason"])
                 if pnl_percent < 0:
                     settings.add_coin_cooldown(coin)
