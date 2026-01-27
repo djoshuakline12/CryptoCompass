@@ -2,7 +2,6 @@ import os
 import aiohttp
 
 USDC_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-SOL_MINT = "So11111111111111111111111111111111111111112"
 JUPITER_BASE = "https://public.jupiterapi.com"
 
 class DexTrader:
@@ -41,6 +40,11 @@ class DexTrader:
             self.solana_address = self.solana_account.address
             self.wallet_address = self.solana_address
             print(f"✅ Solana account ready: {self.solana_address}")
+            
+            # Check send_transaction signature
+            import inspect
+            sig = inspect.signature(self.cdp.solana.send_transaction)
+            print(f"   send_transaction params: {list(sig.parameters.keys())}")
             
             self.initialized = True
             return True
@@ -102,7 +106,7 @@ class DexTrader:
             amount_raw = int(amount_usdc * 1e6)
             
             async with aiohttp.ClientSession() as session:
-                # Get quote WITHOUT platform fee
+                # Get quote
                 quote_url = f"{JUPITER_BASE}/quote?inputMint={USDC_SOLANA}&outputMint={token_address}&amount={amount_raw}&slippageBps=100"
                 print(f"   Getting quote...")
                 
@@ -111,22 +115,18 @@ class DexTrader:
                         return {"success": False, "error": f"Quote failed: {resp.status}"}
                     quote = await resp.json()
                 
-                # Remove any platform fee from quote if present
                 if "platformFee" in quote:
                     del quote["platformFee"]
                 
                 print(f"   Quote: {quote.get('outAmount', 'N/A')} tokens")
                 
-                # Build swap with NO fee
+                # Build swap
                 swap_request = {
                     "quoteResponse": quote,
                     "userPublicKey": self.solana_address,
                     "wrapAndUnwrapSol": True,
                     "useSharedAccounts": True,
-                    "asLegacyTransaction": False,
-                    "useTokenLedger": False,
                     "dynamicComputeUnitLimit": True,
-                    "skipUserAccountsRpcCalls": False,
                     "prioritizationFeeLamports": {
                         "priorityLevelWithMaxLamports": {
                             "maxLamports": 1000000,
@@ -149,13 +149,39 @@ class DexTrader:
                 
                 print(f"   Signing...")
                 signed = await self.solana_account.sign_transaction(swap_tx)
+                print(f"   Signed type: {type(signed)}, attrs: {[a for a in dir(signed) if not a.startswith('_')][:10]}")
                 
-                print(f"   Sending...")
-                signed_tx = signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed)
-                result = await self.cdp.solana.send_transaction(
-                    signed_transaction=signed_tx,
-                    network="mainnet"
-                )
+                # Get the signed transaction string
+                if hasattr(signed, 'signed_transaction'):
+                    signed_tx = signed.signed_transaction
+                elif hasattr(signed, 'transaction'):
+                    signed_tx = signed.transaction
+                else:
+                    signed_tx = str(signed)
+                
+                print(f"   Sending... (tx type: {type(signed_tx)})")
+                
+                # Try different parameter names
+                try:
+                    result = await self.cdp.solana.send_transaction(transaction=signed_tx)
+                except TypeError:
+                    try:
+                        result = await self.cdp.solana.send_transaction(signed_tx)
+                    except TypeError as e:
+                        print(f"   Send error: {e}")
+                        # Try sending via RPC directly
+                        print(f"   Trying direct RPC...")
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "sendTransaction",
+                            "params": [signed_tx, {"encoding": "base64"}]
+                        }
+                        async with session.post("https://api.mainnet-beta.solana.com", json=payload) as rpc_resp:
+                            rpc_data = await rpc_resp.json()
+                            if "error" in rpc_data:
+                                return {"success": False, "error": rpc_data["error"]}
+                            result = rpc_data.get("result")
                 
                 print(f"✅ Swap executed: {result}")
                 return {"success": True, "result": str(result)}
@@ -175,7 +201,6 @@ class DexTrader:
             print(f"🔄 Solana sell: {token_address[:8]}... -> USDC")
             
             async with aiohttp.ClientSession() as session:
-                # Get token balance
                 payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -198,27 +223,22 @@ class DexTrader:
                 if amount_raw == 0:
                     return {"success": False, "error": "Zero balance"}
                 
-                # Get quote
                 quote_url = f"{JUPITER_BASE}/quote?inputMint={token_address}&outputMint={USDC_SOLANA}&amount={amount_raw}&slippageBps=200"
                 
                 async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        return {"success": False, "error": f"Quote failed: {resp.status}"}
+                        return {"success": False, "error": f"Quote failed"}
                     quote = await resp.json()
                 
                 if "platformFee" in quote:
                     del quote["platformFee"]
                 
-                # Build swap
                 swap_request = {
                     "quoteResponse": quote,
                     "userPublicKey": self.solana_address,
                     "wrapAndUnwrapSol": True,
                     "useSharedAccounts": True,
-                    "asLegacyTransaction": False,
-                    "useTokenLedger": False,
                     "dynamicComputeUnitLimit": True,
-                    "skipUserAccountsRpcCalls": False,
                     "prioritizationFeeLamports": {
                         "priorityLevelWithMaxLamports": {
                             "maxLamports": 1000000,
@@ -229,8 +249,6 @@ class DexTrader:
                 
                 async with session.post(f"{JUPITER_BASE}/swap", json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        print(f"   Sell error: {error_text[:200]}")
                         return {"success": False, "error": f"Swap build failed"}
                     swap_data = await resp.json()
                 
@@ -239,11 +257,31 @@ class DexTrader:
                     return {"success": False, "error": "No swap transaction"}
                 
                 signed = await self.solana_account.sign_transaction(swap_tx)
-                signed_tx = signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed)
-                result = await self.cdp.solana.send_transaction(
-                    signed_transaction=signed_tx,
-                    network="mainnet"
-                )
+                
+                if hasattr(signed, 'signed_transaction'):
+                    signed_tx = signed.signed_transaction
+                elif hasattr(signed, 'transaction'):
+                    signed_tx = signed.transaction
+                else:
+                    signed_tx = str(signed)
+                
+                try:
+                    result = await self.cdp.solana.send_transaction(transaction=signed_tx)
+                except TypeError:
+                    try:
+                        result = await self.cdp.solana.send_transaction(signed_tx)
+                    except:
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "sendTransaction",
+                            "params": [signed_tx, {"encoding": "base64"}]
+                        }
+                        async with session.post("https://api.mainnet-beta.solana.com", json=payload) as rpc_resp:
+                            rpc_data = await rpc_resp.json()
+                            if "error" in rpc_data:
+                                return {"success": False, "error": rpc_data["error"]}
+                            result = rpc_data.get("result")
                 
                 print(f"✅ Sell executed: {result}")
                 return {"success": True, "result": str(result)}
