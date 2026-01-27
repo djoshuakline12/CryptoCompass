@@ -228,13 +228,13 @@ async def get_dex_status(user=Depends(verify_token)):
         balances = await dex_trader.get_balances()
         return {
             "initialized": True,
-            "wallet_address": dex_trader.wallet_address,
+            "wallet_address": dex_trader.solana_address,
             "eth_balance": balances.get("eth", 0),
             "usdc_balance": balances.get("usdc", 0),
             "debug": balances.get("error")
         }
     except Exception as e:
-        return {"initialized": True, "wallet_address": dex_trader.wallet_address, "error": str(e)}
+        return {"initialized": True, "wallet_address": dex_trader.solana_address, "error": str(e)}
 
 @app.get("/blacklist")
 async def get_blacklist(user=Depends(verify_token)):
@@ -438,6 +438,6 @@ async def get_wallet_info(user=Depends(verify_token)):
     return {
         "chain": dex_trader.chain,
         "solana_address": dex_trader.solana_address,
-        "base_address": dex_trader.wallet_address,
+        "base_address": dex_trader.solana_address,
         "note": "Use /dex/withdraw to send funds to your personal wallet"
     }
