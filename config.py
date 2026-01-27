@@ -9,7 +9,7 @@ class Settings:
         self.buzz_threshold = 200
         self.take_profit_percent = 15
         self.stop_loss_percent = 8
-        self.live_trading = False
+        self.live_trading = True
         self.trading_enabled = True
         
         self.starting_portfolio_usd = 19
