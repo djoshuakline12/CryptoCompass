@@ -119,22 +119,67 @@ async def update_settings(new_settings: dict) -> dict:
         settings.min_market_cap = new_settings["min_market_cap"]
     if "max_market_cap" in new_settings:
         settings.max_market_cap = new_settings["max_market_cap"]
-    
-    # Update scraper with new market cap settings
-    scraper.max_market_cap = settings.max_market_cap
-    scraper.min_market_cap = settings.min_market_cap
-    
     return {"status": "updated"}
+
+@app.get("/trading/status")
+async def get_trading_status() -> dict:
+    positions = await db.get_open_positions()
+    return {
+        "trading_enabled": settings.trading_enabled,
+        "live_trading": settings.live_trading,
+        "open_positions": len(positions),
+        "max_positions": 3
+    }
 
 @app.post("/trading/start")
 async def start_trading():
     settings.trading_enabled = True
-    return {"status": "trading started"}
+    return {"status": "trading started", "trading_enabled": True}
 
 @app.post("/trading/stop")
 async def stop_trading():
     settings.trading_enabled = False
-    return {"status": "trading stopped"}
+    return {"status": "trading stopped", "trading_enabled": False}
+
+@app.post("/trading/buy")
+async def manual_buy(data: dict) -> dict:
+    coin = data.get("coin")
+    amount = data.get("amount", settings.max_position_usd)
+    
+    if not coin:
+        raise HTTPException(status_code=400, detail="Coin required")
+    
+    if await db.has_open_position(coin):
+        raise HTTPException(status_code=400, detail=f"Already have position in {coin}")
+    
+    price = await trader.get_current_price(coin)
+    quantity = float(amount) / price
+    
+    await db.open_position({
+        "coin": coin,
+        "quantity": quantity,
+        "buy_price": price,
+        "signal": {"source": "manual"}
+    })
+    
+    print(f"✅ MANUAL BUY: {quantity:.4f} {coin} @ ${price:.4f}")
+    return {"status": "bought", "coin": coin, "quantity": quantity, "price": price}
+
+@app.post("/trading/sell")
+async def manual_sell(data: dict) -> dict:
+    coin = data.get("coin")
+    
+    if not coin:
+        raise HTTPException(status_code=400, detail="Coin required")
+    
+    if not await db.has_open_position(coin):
+        raise HTTPException(status_code=400, detail=f"No open position for {coin}")
+    
+    price = await trader.get_current_price(coin)
+    trade = await db.close_position(coin, price)
+    
+    print(f"✅ MANUAL SELL: {coin} @ ${price:.4f} | PnL: {trade['pnl_percent']:+.1f}%")
+    return {"status": "sold", "coin": coin, "price": price, "pnl_percent": trade["pnl_percent"], "pnl_usd": trade["pnl_usd"]}
 
 @app.post("/force-scan")
 async def force_scan() -> dict:
@@ -157,7 +202,6 @@ async def get_ai_insights() -> dict:
             "win_rate_by_source": {}
         }
     
-    # Analyze which sources lead to wins
     source_performance = {}
     for trade in trades:
         source = trade.get("signal_source", "unknown")
@@ -174,7 +218,7 @@ async def get_ai_insights() -> dict:
         "status": "Active",
         "trades_analyzed": len(trades),
         "best_source": best_source,
-        "best_time": "UTC 14:00-18:00",  # Placeholder
+        "best_time": "UTC 14:00-18:00",
         "recommended_threshold": settings.buzz_threshold,
         "win_rate_by_source": win_rates
     }
