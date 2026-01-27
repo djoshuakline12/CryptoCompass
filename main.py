@@ -117,12 +117,12 @@ async def get_positions(user=Depends(verify_token)):
 
 @app.get("/history")
 async def get_history(user=Depends(verify_token)):
-    return await db.get_closed_positions(limit=50)
+    return await db.get_trade_history(limit=50)
 
 @app.get("/stats")
 async def get_stats(user=Depends(verify_token)):
     positions = await db.get_open_positions()
-    history = await db.get_closed_positions(limit=100)
+    history = await db.get_trade_history(limit=100)
     
     total_pnl = sum(h.get("pnl_usd", 0) or 0 for h in history)
     wins = [h for h in history if (h.get("pnl_usd") or 0) > 0]
