@@ -1,13 +1,17 @@
 import os
 import asyncio
 import aiohttp
-import base64
 from datetime import datetime, timezone
 
 USDC_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
-JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP = "https://quote-api.jup.ag/v6/swap"
+
+# Try different Jupiter endpoints
+JUPITER_ENDPOINTS = [
+    "https://api.jup.ag/swap/v1",
+    "https://quote-api.jup.ag/v6",
+    "https://public.jupiterapi.com"
+]
 
 class DexTrader:
     def __init__(self):
@@ -15,6 +19,7 @@ class DexTrader:
         self.solana_account = None
         self.initialized = False
         self.solana_address = None
+        self.wallet_address = None  # For compatibility
         self.chain = "solana"
         
     async def initialize(self):
@@ -25,7 +30,7 @@ class DexTrader:
         cdp_secret = os.getenv("CDP_API_KEY_SECRET", "")
         
         if not cdp_key or not cdp_secret:
-            print("⚠️  CDP API keys not configured - paper trading only")
+            print("⚠️  CDP API keys not configured")
             return False
         
         try:
@@ -42,8 +47,11 @@ class DexTrader:
             
             self.solana_account = await self.cdp.solana.get_or_create_account(name=f"{account_name}-SOL")
             self.solana_address = self.solana_account.address
+            self.wallet_address = self.solana_address  # Compatibility
             print(f"✅ Solana account ready: {self.solana_address}")
-            self.chain = "solana"
+            
+            # Test which Jupiter endpoint works
+            await self.test_jupiter_connection()
             
             self.initialized = True
             return True
@@ -53,6 +61,25 @@ class DexTrader:
             import traceback
             traceback.print_exc()
             return False
+    
+    async def test_jupiter_connection(self):
+        """Test which Jupiter endpoint is reachable"""
+        async with aiohttp.ClientSession() as session:
+            for endpoint in JUPITER_ENDPOINTS:
+                try:
+                    test_url = f"{endpoint}/quote?inputMint={USDC_SOLANA}&outputMint={SOL_MINT}&amount=1000000"
+                    async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            print(f"✅ Jupiter endpoint works: {endpoint}")
+                            self.jupiter_base = endpoint
+                            return
+                        else:
+                            print(f"   {endpoint}: status {resp.status}")
+                except Exception as e:
+                    print(f"   {endpoint}: {str(e)[:50]}")
+            
+            print("⚠️  No Jupiter endpoint reachable - swaps will fail")
+            self.jupiter_base = JUPITER_ENDPOINTS[0]  # Default
     
     async def get_balances(self) -> dict:
         result = {"sol": 0, "usdc": 0, "chain": self.chain}
@@ -106,22 +133,24 @@ class DexTrader:
         try:
             print(f"🔄 Solana swap: ${amount_usdc} USDC -> {token_address[:8]}...")
             
-            amount_raw = int(amount_usdc * 1e6)  # USDC has 6 decimals
+            amount_raw = int(amount_usdc * 1e6)
             
             async with aiohttp.ClientSession() as session:
-                # Step 1: Get quote from Jupiter
-                quote_url = f"{JUPITER_QUOTE}?inputMint={USDC_SOLANA}&outputMint={token_address}&amount={amount_raw}&slippageBps=100"
-                print(f"   Getting quote...")
+                # Step 1: Get quote
+                quote_url = f"{self.jupiter_base}/quote?inputMint={USDC_SOLANA}&outputMint={token_address}&amount={amount_raw}&slippageBps=100"
+                print(f"   Getting quote from {self.jupiter_base}...")
                 
                 async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
-                        return {"success": False, "error": f"Quote failed: {resp.status} - {error_text}"}
+                        return {"success": False, "error": f"Quote failed: {resp.status}"}
                     quote = await resp.json()
                 
-                print(f"   Quote received: {quote.get('outAmount', 'N/A')} tokens")
+                out_amount = quote.get('outAmount', 'N/A')
+                print(f"   Quote: {out_amount} tokens")
                 
-                # Step 2: Get swap transaction from Jupiter
+                # Step 2: Get swap transaction
+                swap_url = f"{self.jupiter_base}/swap"
                 swap_request = {
                     "quoteResponse": quote,
                     "userPublicKey": self.solana_address,
@@ -130,27 +159,26 @@ class DexTrader:
                     "prioritizationFeeLamports": "auto"
                 }
                 
-                print(f"   Building transaction...")
-                async with session.post(JUPITER_SWAP, json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                print(f"   Building swap transaction...")
+                async with session.post(swap_url, json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
-                        return {"success": False, "error": f"Swap build failed: {resp.status} - {error_text}"}
+                        return {"success": False, "error": f"Swap build failed: {resp.status}"}
                     swap_data = await resp.json()
                 
                 swap_tx = swap_data.get("swapTransaction")
                 if not swap_tx:
                     return {"success": False, "error": "No swap transaction returned"}
                 
-                print(f"   Signing transaction with CDP...")
-                
                 # Step 3: Sign with CDP
+                print(f"   Signing with CDP...")
                 signed = await self.solana_account.sign_transaction(swap_tx)
-                print(f"   Signed: {type(signed)}")
                 
                 # Step 4: Send transaction
                 print(f"   Sending transaction...")
+                signed_tx = signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed)
                 result = await self.cdp.solana.send_transaction(
-                    signed_transaction=signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed),
+                    signed_transaction=signed_tx,
                     network="mainnet"
                 )
                 
@@ -171,7 +199,7 @@ class DexTrader:
         try:
             print(f"🔄 Solana sell: {token_address[:8]}... -> USDC")
             
-            # Get token balance and decimals
+            # Get token balance
             async with aiohttp.ClientSession() as session:
                 payload = {
                     "jsonrpc": "2.0",
@@ -187,29 +215,26 @@ class DexTrader:
                     data = await resp.json()
                     accounts = data.get("result", {}).get("value", [])
                     if not accounts:
-                        return {"success": False, "error": "No token balance found"}
+                        return {"success": False, "error": "No token balance"}
                     
                     info = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                    token_amount = info.get("tokenAmount", {})
-                    amount_raw = int(token_amount.get("amount", 0))
-                    
-                    if amount_raw == 0:
-                        return {"success": False, "error": "Zero token balance"}
+                    amount_raw = int(info.get("tokenAmount", {}).get("amount", 0))
+                
+                if amount_raw == 0:
+                    return {"success": False, "error": "Zero balance"}
                 
                 print(f"   Selling {amount_raw} tokens...")
                 
                 # Get quote
-                quote_url = f"{JUPITER_QUOTE}?inputMint={token_address}&outputMint={USDC_SOLANA}&amount={amount_raw}&slippageBps=200"
+                quote_url = f"{self.jupiter_base}/quote?inputMint={token_address}&outputMint={USDC_SOLANA}&amount={amount_raw}&slippageBps=200"
                 
                 async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        return {"success": False, "error": f"Quote failed: {resp.status} - {error_text}"}
+                        return {"success": False, "error": f"Quote failed: {resp.status}"}
                     quote = await resp.json()
                 
-                print(f"   Quote: ~${int(quote.get('outAmount', 0)) / 1e6:.2f} USDC")
-                
                 # Get swap transaction
+                swap_url = f"{self.jupiter_base}/swap"
                 swap_request = {
                     "quoteResponse": quote,
                     "userPublicKey": self.solana_address,
@@ -218,10 +243,9 @@ class DexTrader:
                     "prioritizationFeeLamports": "auto"
                 }
                 
-                async with session.post(JUPITER_SWAP, json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.post(swap_url, json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        return {"success": False, "error": f"Swap build failed: {resp.status} - {error_text}"}
+                        return {"success": False, "error": f"Swap build failed: {resp.status}"}
                     swap_data = await resp.json()
                 
                 swap_tx = swap_data.get("swapTransaction")
@@ -230,8 +254,9 @@ class DexTrader:
                 
                 # Sign and send
                 signed = await self.solana_account.sign_transaction(swap_tx)
+                signed_tx = signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed)
                 result = await self.cdp.solana.send_transaction(
-                    signed_transaction=signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed),
+                    signed_transaction=signed_tx,
                     network="mainnet"
                 )
                 
