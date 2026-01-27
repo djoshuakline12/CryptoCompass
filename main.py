@@ -151,10 +151,10 @@ async def get_stats(user=Depends(verify_token)):
         "win_rate": round(len(wins) / len(history) * 100, 1) if history else 0,
         "portfolio_value": round(capital_deployed + capital_available, 2),
         "daily_pnl": round(settings.daily_pnl, 2),
-        "starting_capital": settings.starting_portfolio_usd,
+        "starting_capital": settings.starting_portfolio_usd, "startingCapital": settings.starting_portfolio_usd,
         "current_portfolio": round(capital_deployed + capital_available, 2),
-        "capital_deployed": round(capital_deployed, 2),
-        "capital_available": round(capital_available, 2),
+        "capital_deployed": round(capital_deployed, 2), "capitalDeployed": round(capital_deployed, 2),
+        "capital_available": round(capital_available, 2), "capitalAvailable": round(capital_available, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
         "realized_pnl": round(total_pnl, 2),
         "max_positions": settings.max_open_positions
