@@ -33,13 +33,11 @@ class DexTrader:
             
             account_name = os.getenv("CDP_ACCOUNT_NAME", "CryptoCompass")
             
-            self.account = await self.cdp.evm.get_or_create_account(
-                name=account_name,
-                network="base"
-            )
+            self.account = await self.cdp.evm.get_or_create_account(name=account_name)
             
             self.wallet_address = self.account.address
-            print(f"✅ Account ready: {self.wallet_address}")
+            print(f"✅ Account ready on Base: {self.wallet_address}")
+            print(f"   Fund this address with ETH and USDC to enable live trading")
             
             self.initialized = True
             return True
@@ -71,7 +69,6 @@ class DexTrader:
                 from_token=from_token,
                 to_token=to_token,
                 from_amount=str(int(amount * 1e18)),
-                network="base",
                 slippage_bps=100
             )
             
