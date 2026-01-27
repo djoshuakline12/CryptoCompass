@@ -83,9 +83,9 @@ class SocialScraper:
                 params={
                     "vs_currency": "usd",
                     "order": "percent_change_24h_desc",
-                    "per_page": 50,
-                    "page": 1,
-                    "sparkline": False
+                    "per_page": "50",
+                    "page": "1",
+                    "sparkline": "false"
                 },
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
@@ -123,9 +123,9 @@ class SocialScraper:
                 params={
                     "vs_currency": "usd",
                     "order": "volume_desc",
-                    "per_page": 100,
-                    "page": 1,
-                    "sparkline": False
+                    "per_page": "100",
+                    "page": "1",
+                    "sparkline": "false"
                 },
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
@@ -139,10 +139,9 @@ class SocialScraper:
                     volume = coin.get("total_volume", 0) or 0
                     market_cap = coin.get("market_cap", 0) or 1
                     
-                    # Volume to market cap ratio - high ratio = unusual activity
                     if market_cap > 0:
                         ratio = volume / market_cap
-                        if ratio > 0.3:  # Volume > 30% of market cap is significant
+                        if ratio > 0.3:
                             score = int(ratio * 100)
                             mentions.append({
                                 "coin": symbol,
@@ -157,7 +156,7 @@ class SocialScraper:
         return mentions
     
     async def scrape_dexscreener_boosted(self) -> list[dict]:
-        """Get boosted tokens on DexScreener - paid promotion = attention"""
+        """Get boosted tokens on DexScreener"""
         mentions = []
         session = await self.get_session()
         
@@ -188,7 +187,7 @@ class SocialScraper:
         return mentions
     
     async def scrape_dexscreener_new_pairs(self) -> list[dict]:
-        """Get new trading pairs - early liquidity = early opportunity"""
+        """Get hot trading pairs from DexScreener"""
         mentions = []
         session = await self.get_session()
         
@@ -209,7 +208,6 @@ class SocialScraper:
                     liquidity = float(pair.get("liquidity", {}).get("usd", 0) or 0)
                     price_change = float(pair.get("priceChange", {}).get("h24", 0) or 0)
                     
-                    # High volume + liquidity + positive momentum
                     if volume_24h > 50000 and liquidity > 30000 and price_change > 5:
                         score = int((volume_24h / 10000) + (price_change * 2))
                         mentions.append({
@@ -225,7 +223,7 @@ class SocialScraper:
         return mentions
 
     async def scrape_coinmarketcap_trending(self) -> list[dict]:
-        """Get CMC trending - different audience than CoinGecko"""
+        """Get CMC trending"""
         mentions = []
         session = await self.get_session()
         
