@@ -6,9 +6,9 @@ from config import settings
 class DexTrader:
     def __init__(self):
         self.cdp = None
-        self.wallet = None
         self.account = None
         self.initialized = False
+        self.wallet_address = None
         
     async def initialize(self):
         if self.initialized:
@@ -22,54 +22,64 @@ class DexTrader:
             return False
         
         try:
-            from cdp import Cdp, Wallet
+            from cdp import CdpClient
             
-            Cdp.configure(cdp_key, cdp_secret)
-            print("✅ CDP SDK configured")
+            os.environ["CDP_API_KEY_ID"] = cdp_key
+            os.environ["CDP_API_KEY_SECRET"] = cdp_secret
             
-            wallet_id = os.getenv("CDP_WALLET_ID", "")
+            self.cdp = CdpClient()
+            await self.cdp.__aenter__()
+            print("✅ CDP SDK connected")
             
-            if wallet_id:
-                self.wallet = await Wallet.fetch(wallet_id)
-                print(f"✅ Loaded wallet: {wallet_id}")
-            else:
-                self.wallet = Wallet.create(network_id="base-mainnet")
-                print(f"✅ Created new CDP wallet on Base")
-                print(f"   Wallet ID: {self.wallet.id}")
-                print(f"   Address: {self.wallet.default_address.address_id}")
-                print(f"   ⚠️  ADD TO RAILWAY: CDP_WALLET_ID={self.wallet.id}")
+            account_name = os.getenv("CDP_ACCOUNT_NAME", "CryptoCompass")
             
-            self.account = self.wallet.default_address
+            self.account = await self.cdp.evm.get_or_create_account(
+                name=account_name,
+                network="base"
+            )
+            
+            self.wallet_address = self.account.address
+            print(f"✅ Account ready: {self.wallet_address}")
+            
             self.initialized = True
             return True
             
-        except ImportError as e:
-            print(f"❌ CDP import error: {e}")
-            print("   Trying alternate import...")
-            try:
-                from cdp import CdpClient
-                print("   Found CdpClient - using async API")
-                self.initialized = False
-                return False
-            except:
-                pass
-            return False
         except Exception as e:
             print(f"❌ CDP init error: {e}")
             import traceback
             traceback.print_exc()
             return False
     
-    async def get_balance(self, token: str = "USDC") -> float:
-        if not self.initialized or not self.wallet:
+    async def get_balance(self, token: str = "ETH") -> float:
+        if not self.initialized or not self.account:
             return 0
         try:
-            balances = self.wallet.balances()
-            for asset, amount in balances.items():
-                if token.upper() in str(asset).upper():
-                    return float(amount)
+            if token.upper() == "ETH":
+                balance = await self.account.balance()
+                return float(balance) if balance else 0
             return 0
-        except:
+        except Exception as e:
+            print(f"Balance error: {e}")
             return 0
+    
+    async def swap(self, from_token: str, to_token: str, amount: float) -> dict:
+        if not self.initialized:
+            return {"success": False, "error": "Not initialized"}
+        
+        try:
+            result = await self.account.swap(
+                from_token=from_token,
+                to_token=to_token,
+                from_amount=str(int(amount * 1e18)),
+                network="base",
+                slippage_bps=100
+            )
+            
+            print(f"✅ Swap complete: {result}")
+            return {"success": True, "result": str(result)}
+            
+        except Exception as e:
+            print(f"❌ Swap error: {e}")
+            return {"success": False, "error": str(e)}
 
 dex_trader = DexTrader()
