@@ -221,16 +221,16 @@ async def get_dex_status(user=Depends(verify_token)):
     if not dex_trader.initialized:
         return {"initialized": False, "error": "CDP not configured"}
     try:
-        eth = await dex_trader.get_balance("ETH")
-        usdc = await dex_trader.get_balance("USDC")
+        eth = await dex_trader.get_eth_balance()
+        usdc = await dex_trader.get_usdc_balance()
         return {
             "initialized": True,
-            "wallet_address": dex_trader.account.address_id if dex_trader.account else None,
+            "wallet_address": dex_trader.wallet_address,
             "eth_balance": eth,
             "usdc_balance": usdc
         }
     except Exception as e:
-        return {"initialized": True, "error": str(e)}
+        return {"initialized": True, "wallet_address": dex_trader.wallet_address, "error": str(e)}
 
 @app.get("/blacklist")
 async def get_blacklist(user=Depends(verify_token)):
