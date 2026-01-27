@@ -47,7 +47,7 @@ async def background_loop():
                 await trader.check_exit_conditions()
             
             settings.record_successful_scan()
-            await asyncio.sleep(120)
+            await asyncio.sleep(30)
         except Exception as e:
             print(f"Error: {e}")
             traceback.print_exc()
