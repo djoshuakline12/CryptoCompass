@@ -381,3 +381,90 @@ Reply: SELL or HOLD, then 5-word reason.
                 await self.db.close_position(coin, current_price, decision["reason"])
                 if pnl_percent < 0:
                     settings.add_coin_cooldown(coin)
+
+    async def get_live_price(self, coin: str) -> dict:
+        """Get fresh price data, bypassing cache"""
+        session = await self.get_session()
+        target_chain = dex_trader.chain if dex_trader.initialized else "solana"
+        
+        data = {
+            "price": 0, "liquidity": 0, "volume_24h": 0,
+            "change_1h": 0, "change_5m": 0, "buys_1h": 0, "sells_1h": 0
+        }
+        
+        try:
+            async with session.get(
+                f"https://api.dexscreener.com/latest/dex/search?q={coin}",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    pairs = result.get("pairs", [])
+                    
+                    for pair in pairs:
+                        symbol = pair.get("baseToken", {}).get("symbol", "").upper().strip()
+                        chain = pair.get("chainId", "")
+                        
+                        if symbol == coin.upper() and chain == target_chain:
+                            data["price"] = float(pair.get("priceUsd") or 0)
+                            data["liquidity"] = float(pair.get("liquidity", {}).get("usd") or 0)
+                            data["volume_24h"] = float(pair.get("volume", {}).get("h24") or 0)
+                            data["change_1h"] = float(pair.get("priceChange", {}).get("h1") or 0)
+                            data["change_5m"] = float(pair.get("priceChange", {}).get("m5") or 0)
+                            txns = pair.get("txns", {})
+                            data["buys_1h"] = txns.get("h1", {}).get("buys", 0)
+                            data["sells_1h"] = txns.get("h1", {}).get("sells", 0)
+                            break
+        except Exception as e:
+            print(f"Live price error for {coin}: {e}")
+        
+        return data
+    
+    async def check_exit_conditions_live(self):
+        """Check positions with live prices (no cache)"""
+        positions = await self.db.get_open_positions()
+        
+        if not positions:
+            return
+        
+        for pos in positions:
+            coin = pos["coin"]
+            buy_price = pos["buy_price"]
+            contract = pos.get("contract_address")
+            
+            # Get LIVE price, bypass cache
+            data = await self.get_live_price(coin)
+            current_price = data["price"]
+            
+            if current_price == 0:
+                continue
+            
+            pnl_percent = ((current_price - buy_price) / buy_price) * 100
+            
+            # Update cache with live data for the sell decision
+            self.token_data_cache[coin.upper()] = {
+                "data": {**data, "contract_address": contract, "chain": dex_trader.chain},
+                "timestamp": datetime.now(timezone.utc)
+            }
+            
+            decision = await self.should_smart_sell(pos, current_price, pnl_percent)
+            
+            if decision["should_sell"]:
+                if settings.live_trading and dex_trader.initialized and contract:
+                    print(f"🔄 LIVE SELL: {coin} @ {pnl_percent:+.1f}% - {decision['reason']}")
+                    result = await dex_trader.swap_token_to_usdc(contract)
+                    
+                    if not result["success"]:
+                        print(f"❌ Sell failed: {result['error']}")
+                        continue
+                    
+                    print(f"✅ Sell success!")
+                else:
+                    print(f"📝 PAPER SELL: {coin} @ {pnl_percent:+.1f}% - {decision['reason']}")
+                
+                if coin in self.position_highs:
+                    del self.position_highs[coin]
+                
+                await self.db.close_position(coin, current_price, decision["reason"])
+                if pnl_percent < 0:
+                    settings.add_coin_cooldown(coin)
