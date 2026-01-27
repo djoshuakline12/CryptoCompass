@@ -12,25 +12,26 @@ class Settings:
         self.live_trading = False
         self.trading_enabled = True
         
-        self.starting_portfolio_usd = 500
+        self.starting_portfolio_usd = 19
         self.realized_pnl = 0
-        self.max_open_positions = 5
+        self.max_open_positions = 3
         
         self.use_ai_sizing = True
-        self.min_position_usd = 20
-        self.max_position_usd = 150
+        self.use_ai_smart_sell = True
+        self.min_position_usd = 5
+        self.max_position_usd = 19
         
-        self.min_market_cap = 1_000_000
-        self.max_market_cap = 500_000_000
+        self.min_market_cap = 100_000
+        self.max_market_cap = 50_000_000
         
-        self.min_liquidity = 50_000
-        self.min_volume_24h = 100_000
+        self.min_liquidity = 25_000
+        self.min_volume_24h = 50_000
         
         self.blacklisted_coins = set()
         self.cooldown_hours = 24
         self.cooldown_coins = {}
-        self.max_daily_loss_usd = 100
-        self.max_daily_loss_percent = 20
+        self.max_daily_loss_usd = 10
+        self.max_daily_loss_percent = 50
         self.daily_pnl = 0
         self.daily_pnl_reset_date = datetime.now(timezone.utc).date()
         

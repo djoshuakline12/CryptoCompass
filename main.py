@@ -88,8 +88,9 @@ async def get_signals(user=Depends(verify_token)):
                 signal["market_cap"] = data["market_cap"]
                 signal["liquidity"] = data["liquidity"]
                 signal["volume_24h"] = data["volume_24h"]
+                signal["current_price"] = data["price"]
             except:
-                pass
+                signal["current_price"] = 0
         return signals
     except Exception as e:
         print(f"Error in /signals: {e}")
@@ -171,6 +172,7 @@ async def get_settings(user=Depends(verify_token)):
         "max_open_positions": settings.max_open_positions,
         "starting_portfolio_usd": settings.starting_portfolio_usd,
         "use_ai_sizing": settings.use_ai_sizing,
+        "use_ai_smart_sell": settings.use_ai_smart_sell,
         "cooldown_hours": settings.cooldown_hours,
         "max_daily_loss_usd": settings.max_daily_loss_usd
     }
@@ -188,6 +190,8 @@ async def update_settings(new: dict, user=Depends(verify_token)):
         settings.trading_enabled = new["trading_enabled"]
     if "use_ai_sizing" in new:
         settings.use_ai_sizing = new["use_ai_sizing"]
+    if "use_ai_smart_sell" in new:
+        settings.use_ai_smart_sell = new["use_ai_smart_sell"]
     return {"status": "updated"}
 
 @app.get("/trading/status")
@@ -271,6 +275,17 @@ async def start_trading(user=Depends(verify_token)):
 async def stop_trading(user=Depends(verify_token)):
     settings.trading_enabled = False
     return {"status": "stopped"}
+
+@app.post("/trading/go-live")
+async def enable_live_trading(user=Depends(verify_token)):
+    settings.live_trading = True
+    settings.trading_enabled = True
+    return {"status": "LIVE TRADING ENABLED", "live_trading": True}
+
+@app.post("/trading/paper")
+async def enable_paper_trading(user=Depends(verify_token)):
+    settings.live_trading = False
+    return {"status": "Paper trading enabled", "live_trading": False}
 
 @app.post("/trading/buy")
 async def manual_buy(data: dict, user=Depends(verify_token)):
