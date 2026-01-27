@@ -9,66 +9,31 @@ class AnomalyDetector:
     async def detect_signals(self) -> list[dict]:
         signals = []
         
-        for coin in settings.tracked_coins:
-            try:
-                signal = await self.analyze_coin(coin)
-                if signal:
-                    signals.append(signal)
-                    await self.db.save_signal(signal)
-                    print(f"SIGNAL: {coin} is {signal['percent_above_baseline']:.0f}% above baseline!")
-            except Exception as e:
-                print(f"Error analyzing {coin}: {e}")
+        # Get all recent mentions and treat high-scoring ones as signals
+        all_mentions = await self.db.get_all_recent_mentions()
         
-        # Also check for any coin with high recent mentions (for early detection)
-        hot_coins = await self.detect_hot_coins()
-        for signal in hot_coins:
-            if signal["coin"] not in [s["coin"] for s in signals]:
+        # Group by coin and sum scores
+        coin_scores = {}
+        for mention in all_mentions:
+            coin = mention.get("coin", "")
+            count = mention.get("count", 0)
+            if coin:
+                coin_scores[coin] = coin_scores.get(coin, 0) + count
+        
+        # Top scoring coins become signals
+        sorted_coins = sorted(coin_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        for coin, score in sorted_coins[:10]:  # Top 10 coins
+            if score >= 50:  # Minimum score threshold
+                signal = {
+                    "coin": coin,
+                    "current_mentions": score,
+                    "baseline_mentions": 0,
+                    "percent_above_baseline": score,  # Use score as %
+                    "threshold": settings.buzz_threshold
+                }
                 signals.append(signal)
                 await self.db.save_signal(signal)
-        
-        return signals
-    
-    async def analyze_coin(self, coin: str) -> dict | None:
-        baseline = await self.db.get_baseline(coin)
-        
-        if baseline < settings.min_baseline_mentions:
-            return None
-        
-        recent = await self.db.get_recent_mentions(coin, hours=1)
-        
-        if baseline == 0:
-            return None
-            
-        percent_above = ((recent - baseline) / baseline) * 100
-        
-        if percent_above >= settings.buzz_threshold:
-            return {
-                "coin": coin,
-                "current_mentions": recent,
-                "baseline_mentions": round(baseline, 1),
-                "percent_above_baseline": round(percent_above, 1),
-                "threshold": settings.buzz_threshold
-            }
-        
-        return None
-    
-    async def detect_hot_coins(self) -> list[dict]:
-        """Detect coins with high activity even without baseline comparison"""
-        signals = []
-        
-        # Get all recent mentions
-        for coin in settings.tracked_coins:
-            recent = await self.db.get_recent_mentions(coin, hours=1)
-            
-            # If a coin has significant mentions, flag it
-            if recent >= 100:  # High absolute activity
-                signals.append({
-                    "coin": coin,
-                    "current_mentions": recent,
-                    "baseline_mentions": 0,
-                    "percent_above_baseline": 999,  # Mark as hot
-                    "threshold": settings.buzz_threshold
-                })
-                print(f"HOT COIN: {coin} with {recent} mentions")
+                print(f"🚨 SIGNAL: {coin} (score: {score})")
         
         return signals
