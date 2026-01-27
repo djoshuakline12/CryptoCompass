@@ -54,7 +54,7 @@ async def position_monitor_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db.initialize()
+    # db already initializes in __init__
     await dex_trader.initialize()
     
     # Start both loops
