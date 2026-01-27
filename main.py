@@ -26,9 +26,11 @@ async def background_loop():
                 await trader.process_signals(signals)
                 await trader.check_exit_conditions()
             
+            settings.record_successful_scan()
             await asyncio.sleep(120)
         except Exception as e:
             print(f"Error in background loop: {e}")
+            settings.record_error(str(e))
             await asyncio.sleep(60)
 
 @asynccontextmanager
@@ -86,31 +88,17 @@ async def get_stats() -> dict:
         current_price = await trader.get_current_price(pos["coin"])
         unrealized_pnl += (current_price - pos["buy_price"]) * pos["quantity"]
     
-    if not trades:
-        return {
-            "total_realized_pnl": settings.realized_pnl,
-            "total_unrealized_pnl": round(unrealized_pnl, 2),
-            "total_pnl": round(settings.realized_pnl + unrealized_pnl, 2),
-            "win_rate": 0,
-            "total_trades": 0,
-            "avg_hold_hours": 0,
-            "open_positions": len(positions),
-            "starting_portfolio": settings.starting_portfolio_usd,
-            "current_portfolio": round(settings.total_portfolio_usd + unrealized_pnl, 2),
-            "portfolio_change_percent": 0
-        }
-    
-    winners = [t for t in trades if t["pnl_percent"] > 0]
-    
+    winners = [t for t in trades if t.get("pnl_percent", 0) > 0]
     portfolio_change = ((settings.total_portfolio_usd + unrealized_pnl - settings.starting_portfolio_usd) / settings.starting_portfolio_usd) * 100
     
     return {
         "total_realized_pnl": round(settings.realized_pnl, 2),
         "total_unrealized_pnl": round(unrealized_pnl, 2),
         "total_pnl": round(settings.realized_pnl + unrealized_pnl, 2),
-        "win_rate": round(len(winners) / len(trades) * 100, 1),
+        "daily_pnl": round(settings.daily_pnl, 2),
+        "win_rate": round(len(winners) / len(trades) * 100, 1) if trades else 0,
         "total_trades": len(trades),
-        "avg_hold_hours": round(sum(t["hold_hours"] for t in trades) / len(trades), 1),
+        "avg_hold_hours": round(sum(t.get("hold_hours", 0) for t in trades) / len(trades), 1) if trades else 0,
         "open_positions": len(positions),
         "starting_portfolio": settings.starting_portfolio_usd,
         "current_portfolio": round(settings.total_portfolio_usd + unrealized_pnl, 2),
@@ -133,7 +121,10 @@ async def get_settings() -> dict:
         "starting_portfolio_usd": settings.starting_portfolio_usd,
         "total_portfolio_usd": settings.total_portfolio_usd,
         "realized_pnl": settings.realized_pnl,
-        "use_ai_sizing": settings.use_ai_sizing
+        "use_ai_sizing": settings.use_ai_sizing,
+        "cooldown_hours": settings.cooldown_hours,
+        "max_daily_loss_usd": settings.max_daily_loss_usd,
+        "max_daily_loss_percent": settings.max_daily_loss_percent
     }
 
 @app.post("/settings")
@@ -162,25 +153,82 @@ async def update_settings(new_settings: dict) -> dict:
         settings.starting_portfolio_usd = new_settings["starting_portfolio_usd"]
     if "use_ai_sizing" in new_settings:
         settings.use_ai_sizing = new_settings["use_ai_sizing"]
+    if "cooldown_hours" in new_settings:
+        settings.cooldown_hours = new_settings["cooldown_hours"]
+    if "max_daily_loss_usd" in new_settings:
+        settings.max_daily_loss_usd = new_settings["max_daily_loss_usd"]
+    if "max_daily_loss_percent" in new_settings:
+        settings.max_daily_loss_percent = new_settings["max_daily_loss_percent"]
     return {"status": "updated"}
 
 @app.get("/trading/status")
 async def get_trading_status() -> dict:
     positions = await db.get_open_positions()
-    capital_in_positions = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
+    capital_used = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
     
     return {
         "trading_enabled": settings.trading_enabled,
         "live_trading": settings.live_trading,
         "open_positions": len(positions),
         "max_positions": settings.max_open_positions,
-        "capital_deployed": round(capital_in_positions, 2),
-        "capital_available": round(settings.total_portfolio_usd - capital_in_positions, 2),
-        "starting_portfolio": settings.starting_portfolio_usd,
+        "capital_deployed": round(capital_used, 2),
+        "capital_available": round(settings.total_portfolio_usd - capital_used, 2),
         "current_portfolio": round(settings.total_portfolio_usd, 2),
-        "realized_pnl": round(settings.realized_pnl, 2),
+        "daily_pnl": round(settings.daily_pnl, 2),
+        "daily_loss_limit_hit": settings.is_daily_loss_limit_hit(),
         "use_ai_sizing": settings.use_ai_sizing
     }
+
+@app.get("/health")
+async def get_health() -> dict:
+    return {
+        "status": "critical" if settings.is_health_critical() else "healthy",
+        "last_successful_scan": settings.last_successful_scan.isoformat() if settings.last_successful_scan else None,
+        "consecutive_errors": settings.consecutive_errors,
+        "last_error": settings.last_error,
+        "daily_loss_limit_hit": settings.is_daily_loss_limit_hit(),
+        "daily_pnl": round(settings.daily_pnl, 2)
+    }
+
+@app.get("/blacklist")
+async def get_blacklist() -> dict:
+    return {
+        "blacklisted_coins": list(settings.blacklisted_coins),
+        "cooldown_coins": {coin: expiry.isoformat() for coin, expiry in settings.cooldown_coins.items()}
+    }
+
+@app.post("/blacklist/add")
+async def add_to_blacklist(data: dict) -> dict:
+    coin = data.get("coin", "").upper()
+    reason = data.get("reason", "Manual blacklist")
+    
+    if not coin:
+        raise HTTPException(status_code=400, detail="Coin required")
+    
+    settings.blacklist_coin(coin, reason)
+    return {"status": "blacklisted", "coin": coin}
+
+@app.post("/blacklist/remove")
+async def remove_from_blacklist(data: dict) -> dict:
+    coin = data.get("coin", "").upper()
+    
+    if not coin:
+        raise HTTPException(status_code=400, detail="Coin required")
+    
+    settings.unblacklist_coin(coin)
+    return {"status": "removed", "coin": coin}
+
+@app.post("/cooldown/clear")
+async def clear_cooldown(data: dict) -> dict:
+    coin = data.get("coin", "").upper()
+    
+    if coin:
+        if coin in settings.cooldown_coins:
+            del settings.cooldown_coins[coin]
+        return {"status": "cleared", "coin": coin}
+    else:
+        settings.cooldown_coins = {}
+        return {"status": "all_cleared"}
 
 @app.post("/trading/start")
 async def start_trading():
@@ -194,11 +242,14 @@ async def stop_trading():
 
 @app.post("/trading/buy")
 async def manual_buy(data: dict) -> dict:
-    coin = data.get("coin")
+    coin = data.get("coin", "").upper()
     amount = data.get("amount", settings.max_position_usd)
     
     if not coin:
         raise HTTPException(status_code=400, detail="Coin required")
+    
+    if settings.is_coin_blacklisted(coin):
+        raise HTTPException(status_code=400, detail=f"{coin} is blacklisted")
     
     if await db.has_open_position(coin):
         raise HTTPException(status_code=400, detail=f"Already have position in {coin}")
@@ -220,7 +271,7 @@ async def manual_buy(data: dict) -> dict:
 
 @app.post("/trading/sell")
 async def manual_sell(data: dict) -> dict:
-    coin = data.get("coin")
+    coin = data.get("coin", "").upper()
     
     if not coin:
         raise HTTPException(status_code=400, detail="Coin required")
@@ -245,22 +296,15 @@ async def get_ai_insights() -> dict:
     trades = await db.get_trade_history(limit=100)
     
     if len(trades) < 5:
-        return {
-            "status": "Learning...",
-            "trades_analyzed": len(trades),
-            "best_source": "Not enough data",
-            "recommendation": "Gather more trade data"
-        }
+        return {"status": "Learning...", "trades_analyzed": len(trades), "recommendation": "Gather more data"}
     
     source_performance = {}
     for trade in trades:
         source = trade.get("signal_source", "unknown")
         pnl = trade.get("pnl_percent", 0)
-        
         if source not in source_performance:
-            source_performance[source] = {"wins": 0, "total": 0, "pnl": 0}
+            source_performance[source] = {"wins": 0, "total": 0}
         source_performance[source]["total"] += 1
-        source_performance[source]["pnl"] += pnl
         if pnl > 0:
             source_performance[source]["wins"] += 1
     

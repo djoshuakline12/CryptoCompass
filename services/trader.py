@@ -34,6 +34,31 @@ class Trader:
             self.session = aiohttp.ClientSession()
         return self.session
     
+    async def send_notification(self, message: str, alert_type: str = "info"):
+        """Send notification via Discord webhook"""
+        if not settings.discord_webhook_url:
+            return
+        
+        try:
+            session = await self.get_session()
+            
+            colors = {"info": 3447003, "success": 5763719, "warning": 16776960, "error": 15548997}
+            
+            payload = {
+                "embeds": [{
+                    "title": "🤖 Crypto Buzz Trader",
+                    "description": message,
+                    "color": colors.get(alert_type, 3447003),
+                    "timestamp": datetime.utcnow().isoformat()
+                }]
+            }
+            
+            async with session.post(settings.discord_webhook_url, json=payload) as resp:
+                if resp.status != 204:
+                    print(f"Discord notification failed: {resp.status}")
+        except Exception as e:
+            print(f"Notification error: {e}")
+    
     async def get_market_cap(self, coin: str) -> float:
         if coin in self.market_cap_cache:
             return self.market_cap_cache[coin]
@@ -86,7 +111,6 @@ class Trader:
         
         self.price_cache[coin] = price
         
-        # Track history
         if coin not in self.price_history:
             self.price_history[coin] = []
         self.price_history[coin].append({"price": price, "timestamp": datetime.utcnow()})
@@ -97,13 +121,7 @@ class Trader:
     async def get_token_momentum(self, coin: str) -> dict:
         session = await self.get_session()
         
-        momentum = {
-            "trend": "neutral",
-            "strength": 0,
-            "predicted_upside": 0,
-            "confidence": 0,
-            "reason": ""
-        }
+        momentum = {"trend": "neutral", "strength": 0, "predicted_upside": 10, "confidence": 40, "reason": ""}
         
         try:
             async with session.get(f"https://api.dexscreener.com/latest/dex/search?q={coin}", timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -121,82 +139,55 @@ class Trader:
                         buys_1h = txns.get("h1", {}).get("buys", 0)
                         sells_1h = txns.get("h1", {}).get("sells", 0)
                         
-                        # Momentum slowing
                         if change_24h > 20 and change_1h < 2 and change_5m < 0:
-                            momentum["trend"] = "down"
-                            momentum["reason"] = "Momentum slowing after run"
-                            momentum["predicted_upside"] = -5
-                            momentum["confidence"] = 70
-                        
-                        # Sell pressure
+                            momentum = {"trend": "down", "predicted_upside": -5, "confidence": 70, "reason": "Momentum slowing"}
                         elif sells_1h > buys_1h * 1.5:
-                            momentum["trend"] = "down"
-                            momentum["reason"] = "Heavy sell pressure"
-                            momentum["predicted_upside"] = -10
-                            momentum["confidence"] = 60
-                        
-                        # Strong momentum
+                            momentum = {"trend": "down", "predicted_upside": -10, "confidence": 60, "reason": "Heavy sell pressure"}
                         elif change_5m > 5 and change_1h > 10 and buys_1h > sells_1h:
-                            momentum["trend"] = "up"
-                            momentum["predicted_upside"] = min(change_1h * 0.5, 30)
-                            momentum["reason"] = "Strong buying momentum"
-                            momentum["confidence"] = 70
-                        
-                        # Already pumped
+                            momentum = {"trend": "up", "predicted_upside": min(change_1h * 0.5, 30), "confidence": 70, "reason": "Strong momentum"}
                         elif change_24h > 50 and change_1h < 5:
-                            momentum["predicted_upside"] = 5
-                            momentum["reason"] = "Already pumped, limited upside"
-                            momentum["confidence"] = 60
-                        
-                        else:
-                            momentum["predicted_upside"] = 10
-                            momentum["confidence"] = 40
-                        
-        except Exception as e:
-            print(f"Momentum error for {coin}: {e}")
+                            momentum = {"trend": "neutral", "predicted_upside": 5, "confidence": 60, "reason": "Already pumped"}
+        except:
+            pass
         
         return momentum
     
     def calculate_risk_score(self, signal: dict, market_cap: float) -> dict:
-        risk_factors = []
-        
-        source = signal.get("source", "")
-        score = signal.get("current_mentions", 0)
-        age_hours = signal.get("age_hours", 999)
+        risk = 0
         
         if market_cap == 0:
-            risk_factors.append(30)
+            risk += 30
         elif market_cap < 10_000_000:
-            risk_factors.append(25)
+            risk += 25
         elif market_cap < 50_000_000:
-            risk_factors.append(15)
+            risk += 15
         else:
-            risk_factors.append(5)
+            risk += 5
         
+        age_hours = signal.get("age_hours", 999)
         if age_hours < 6:
-            risk_factors.append(25)
+            risk += 25
         elif age_hours < 24:
-            risk_factors.append(15)
+            risk += 15
         
+        source = signal.get("source", "")
         if any(s in source for s in ["twitter", "telegram", "reddit"]):
-            risk_factors.append(15)
+            risk += 15
         
-        total_risk = min(sum(risk_factors), 100)
+        risk = min(risk, 100)
         
-        risk_multiplier = (100 - total_risk) / 100
+        risk_multiplier = (100 - risk) / 100
         base_position = settings.total_portfolio_usd / settings.max_open_positions
         position_size = max(settings.min_position_usd, min(base_position * risk_multiplier, settings.max_position_usd))
         
         return {
-            "risk_score": total_risk,
+            "risk_score": risk,
             "recommended_position_usd": round(position_size, 2),
-            "risk_level": "HIGH" if total_risk > 60 else "MEDIUM" if total_risk > 30 else "LOW"
+            "risk_level": "HIGH" if risk > 60 else "MEDIUM" if risk > 30 else "LOW"
         }
     
     async def should_smart_sell(self, position: dict, current_price: float, pnl_percent: float) -> dict:
         coin = position["coin"]
-        
-        decision = {"should_sell": False, "reason": "", "confidence": 0}
         
         if pnl_percent <= -settings.stop_loss_percent:
             return {"should_sell": True, "reason": f"Stop loss ({pnl_percent:.1f}%)", "confidence": 100}
@@ -206,21 +197,37 @@ class Trader:
         
         momentum = await self.get_token_momentum(coin)
         
-        # In profit and momentum dying
         if pnl_percent > 5 and momentum["trend"] == "down" and momentum["confidence"] > 50:
-            return {"should_sell": True, "reason": f"Profit +{pnl_percent:.1f}%, {momentum['reason']}", "confidence": momentum["confidence"]}
+            return {"should_sell": True, "reason": f"+{pnl_percent:.1f}%, {momentum['reason']}", "confidence": momentum["confidence"]}
         
-        # Small profit, no upside
         if pnl_percent > 3 and momentum["predicted_upside"] < 3 and momentum["confidence"] > 50:
             return {"should_sell": True, "reason": f"Locked +{pnl_percent:.1f}%, limited upside", "confidence": momentum["confidence"]}
         
-        decision["predicted_upside"] = momentum["predicted_upside"]
-        return decision
+        return {"should_sell": False, "reason": "", "predicted_upside": momentum["predicted_upside"]}
     
     async def process_signals(self, signals: list[dict]):
+        # === SAFETY CHECKS ===
+        
         if not settings.trading_enabled:
             print("⏸️ Trading disabled")
             return
+        
+        # Check daily loss limit
+        if settings.is_daily_loss_limit_hit():
+            print(f"🛑 DAILY LOSS LIMIT HIT: ${settings.daily_pnl:.2f} - Trading paused")
+            await self.send_notification(
+                f"⚠️ Daily loss limit reached!\nDaily P&L: ${settings.daily_pnl:.2f}\nTrading paused until tomorrow.",
+                "warning"
+            )
+            return
+        
+        # Check health
+        if settings.is_health_critical():
+            print(f"🚨 HEALTH CRITICAL: {settings.consecutive_errors} consecutive errors")
+            await self.send_notification(
+                f"🚨 Bot health critical!\n{settings.consecutive_errors} consecutive errors\nLast error: {settings.last_error}",
+                "error"
+            )
         
         open_positions = await self.db.get_open_positions()
         if len(open_positions) >= settings.max_open_positions:
@@ -230,11 +237,25 @@ class Trader:
         used_capital = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in open_positions)
         available_capital = settings.total_portfolio_usd - used_capital
         
-        print(f"💰 Portfolio: ${settings.total_portfolio_usd:.2f} (Available: ${available_capital:.2f})")
+        print(f"💰 Portfolio: ${settings.total_portfolio_usd:.2f} | Available: ${available_capital:.2f} | Daily P&L: ${settings.daily_pnl:.2f}")
         
         for signal in signals[:5]:
-            coin = signal["coin"]
+            coin = signal["coin"].upper()
             
+            # === COIN SAFETY CHECKS ===
+            
+            # Check blacklist
+            if settings.is_coin_blacklisted(coin):
+                print(f"🚫 Skipping {coin} (blacklisted)")
+                continue
+            
+            # Check cooldown
+            if settings.is_coin_on_cooldown(coin):
+                remaining = settings.get_cooldown_remaining(coin)
+                print(f"⏳ Skipping {coin} (cooldown: {remaining:.1f}h remaining)")
+                continue
+            
+            # Check if already holding
             if await self.db.has_open_position(coin):
                 continue
             
@@ -267,7 +288,19 @@ class Trader:
                     "risk_score": risk["risk_score"],
                     "signal": signal
                 })
+                
+                # Send notification
+                await self.send_notification(
+                    f"🟢 **BOUGHT {coin}**\n"
+                    f"Price: ${price:.4f}\n"
+                    f"Amount: ${position_usd:.2f}\n"
+                    f"Risk: {risk.get('risk_level', 'MEDIUM')}",
+                    "success"
+                )
             break
+        
+        # Record successful scan
+        settings.record_successful_scan()
     
     async def buy(self, coin: str, quantity: float, price: float) -> bool:
         if not settings.live_trading:
@@ -281,6 +314,7 @@ class Trader:
             return True
         except Exception as e:
             print(f"❌ Buy failed: {e}")
+            settings.record_error(str(e))
             return False
     
     async def sell(self, coin: str, quantity: float, price: float) -> bool:
@@ -295,6 +329,7 @@ class Trader:
             return True
         except Exception as e:
             print(f"❌ Sell failed: {e}")
+            settings.record_error(str(e))
             return False
     
     async def check_exit_conditions(self):
@@ -310,6 +345,7 @@ class Trader:
                 continue
             
             pnl_percent = ((current_price - buy_price) / buy_price) * 100
+            pnl_usd = (current_price - buy_price) * quantity
             
             decision = await self.should_smart_sell(position, current_price, pnl_percent)
             
@@ -319,6 +355,18 @@ class Trader:
                 
                 if await self.sell(coin, quantity, current_price):
                     await self.db.close_position(coin, current_price, decision["reason"])
+                    
+                    # Add cooldown if sold at a loss
+                    if pnl_percent < 0:
+                        settings.add_coin_cooldown(coin)
+                    
+                    # Send notification
+                    await self.send_notification(
+                        f"{emoji} **SOLD {coin}**\n"
+                        f"P&L: {pnl_percent:+.1f}% (${pnl_usd:+.2f})\n"
+                        f"Reason: {decision['reason']}",
+                        "success" if pnl_percent > 0 else "warning"
+                    )
             else:
                 upside = decision.get('predicted_upside', 0)
                 print(f"📊 Holding {coin}: {pnl_percent:+.1f}% (upside: +{upside:.0f}%)")
