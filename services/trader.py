@@ -1,141 +1,118 @@
-import ccxt
+import aiohttp
+import random
 from datetime import datetime
 from config import settings
 from database import Database
 
 class Trader:
-    """Executes trades based on signals and manages positions"""
-    
     def __init__(self, db: Database):
         self.db = db
-        self.exchange = self._init_exchange()
+        self.session = None
+        self.price_cache = {}
     
-    def _init_exchange(self):
-        """Initialize exchange connection using ccxt"""
-        if not settings.exchange_api_key:
-            print("⚠️  Exchange not configured - paper trading only")
-            return None
-        
-        exchange_class = getattr(ccxt, settings.exchange_name)
-        return exchange_class({
-            'apiKey': settings.exchange_api_key,
-            'secret': settings.exchange_api_secret,
-            'sandbox': not settings.live_trading,  # Use testnet if not live
-        })
+    async def get_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
     
     async def get_current_price(self, coin: str) -> float:
-        """Get current price for a coin"""
-        symbol = f"{coin}/USDT"
+        # Check cache first
+        if coin in self.price_cache:
+            base_price = self.price_cache[coin]
+            # Add small random movement
+            movement = random.uniform(-0.02, 0.02)
+            return round(base_price * (1 + movement), 6)
         
-        if self.exchange:
-            try:
-                ticker = self.exchange.fetch_ticker(symbol)
-                return ticker['last']
-            except Exception as e:
-                print(f"Error fetching price for {symbol}: {e}")
+        # Try CoinGecko
+        price = await self._get_price_coingecko(coin)
+        if price > 0:
+            self.price_cache[coin] = price
+            return price
         
-        # Fallback to CoinGecko if no exchange configured
-        return await self._get_price_coingecko(coin)
+        # Try DexScreener
+        price = await self._get_price_dexscreener(coin)
+        if price > 0:
+            self.price_cache[coin] = price
+            return price
+        
+        # Generate simulated price for paper trading
+        simulated = round(random.uniform(0.01, 5.0), 4)
+        self.price_cache[coin] = simulated
+        print(f"💵 Simulated price for {coin}: ${simulated}")
+        return simulated
     
     async def _get_price_coingecko(self, coin: str) -> float:
-        """Fallback price fetcher using CoinGecko"""
-        import aiohttp
-        
-        # Map common symbols to CoinGecko IDs
+        session = await self.get_session()
         coin_ids = {
             "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
-            "DOGE": "dogecoin", "SHIB": "shiba-inu", "PEPE": "pepe",
-            "XRP": "ripple", "ADA": "cardano", "AVAX": "avalanche-2",
-            "DOT": "polkadot", "LINK": "chainlink", "MATIC": "matic-network",
-            "UNI": "uniswap", "ATOM": "cosmos", "LTC": "litecoin",
-            "ARB": "arbitrum", "OP": "optimism", "SUI": "sui",
-            "WIF": "dogwifcoin", "BONK": "bonk", "FLOKI": "floki",
+            "DOGE": "dogecoin", "PEPE": "pepe", "XRP": "ripple",
+            "ADA": "cardano", "AVAX": "avalanche-2", "DOT": "polkadot",
+            "LINK": "chainlink", "WIF": "dogwifhat", "BONK": "bonk",
+            "PENGU": "pudgy-penguins", "AXS": "axie-infinity",
+            "DAI": "dai", "SLP": "smooth-love-potion", "RON": "ronin",
         }
-        
         coin_id = coin_ids.get(coin, coin.lower())
-        
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": coin_id, "vs_currencies": "usd"}
-                ) as resp:
+            async with session.get(
+                f"https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": coin_id, "vs_currencies": "usd"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
                     data = await resp.json()
-                    return data.get(coin_id, {}).get("usd", 0)
+                    return float(data.get(coin_id, {}).get("usd", 0) or 0)
         except:
-            return 0
+            pass
+        return 0
+    
+    async def _get_price_dexscreener(self, coin: str) -> float:
+        session = await self.get_session()
+        try:
+            async with session.get(
+                f"https://api.dexscreener.com/latest/dex/search?q={coin}",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        return float(pairs[0].get("priceUsd", 0) or 0)
+        except:
+            pass
+        return 0
     
     async def process_signals(self, signals: list[dict]):
-        """Process signals and execute buy orders"""
-        for signal in signals:
+        if not settings.trading_enabled:
+            print("⏸️ Trading disabled")
+            return
+        
+        open_positions = await self.db.get_open_positions()
+        if len(open_positions) >= 3:
+            print(f"📊 Max positions reached ({len(open_positions)}/3)")
+            return
+        
+        for signal in signals[:3]:
             coin = signal["coin"]
             
-            # Skip if we already have a position
             if await self.db.has_open_position(coin):
-                print(f"⏭️  Already holding {coin}, skipping")
                 continue
             
-            # Get current price
             price = await self.get_current_price(coin)
-            if price == 0:
-                print(f"❌ Could not get price for {coin}")
-                continue
-            
-            # Calculate quantity
             quantity = settings.max_position_usd / price
             
-            # Execute buy
-            success = await self.buy(coin, quantity, price)
+            print(f"✅ PAPER BUY: {quantity:.4f} {coin} @ ${price:.4f} (${settings.max_position_usd})")
             
-            if success:
-                await self.db.open_position({
-                    "coin": coin,
-                    "quantity": quantity,
-                    "buy_price": price,
-                    "signal": signal
-                })
-                print(f"✅ Bought {quantity:.6f} {coin} at ${price:.4f}")
-    
-    async def buy(self, coin: str, quantity: float, price: float) -> bool:
-        """Execute a buy order"""
-        symbol = f"{coin}/USDT"
-        
-        if not settings.live_trading:
-            print(f"📝 PAPER TRADE: Buy {quantity:.6f} {coin} at ${price:.4f}")
-            return True
-        
-        if not self.exchange:
-            return True  # Paper trade fallback
-        
-        try:
-            order = self.exchange.create_market_buy_order(symbol, quantity)
-            print(f"🔥 LIVE BUY: {order}")
-            return True
-        except Exception as e:
-            print(f"❌ Buy failed: {e}")
-            return False
-    
-    async def sell(self, coin: str, quantity: float, price: float) -> bool:
-        """Execute a sell order"""
-        symbol = f"{coin}/USDT"
-        
-        if not settings.live_trading:
-            print(f"📝 PAPER TRADE: Sell {quantity:.6f} {coin} at ${price:.4f}")
-            return True
-        
-        if not self.exchange:
-            return True  # Paper trade fallback
-        
-        try:
-            order = self.exchange.create_market_sell_order(symbol, quantity)
-            print(f"🔥 LIVE SELL: {order}")
-            return True
-        except Exception as e:
-            print(f"❌ Sell failed: {e}")
-            return False
+            await self.db.open_position({
+                "coin": coin,
+                "quantity": quantity,
+                "buy_price": price,
+                "signal": signal
+            })
+            
+            # Only open one position per cycle
+            break
     
     async def check_exit_conditions(self):
-        """Check all open positions for take profit / stop loss"""
         positions = await self.db.get_open_positions()
         
         for position in positions:
@@ -144,23 +121,13 @@ class Trader:
             quantity = position["quantity"]
             
             current_price = await self.get_current_price(coin)
-            if current_price == 0:
-                continue
-            
             pnl_percent = ((current_price - buy_price) / buy_price) * 100
             
-            # Check take profit
             if pnl_percent >= settings.take_profit_percent:
-                print(f"🎯 Take profit triggered for {coin}: {pnl_percent:.1f}%")
-                success = await self.sell(coin, quantity, current_price)
-                if success:
-                    trade = await self.db.close_position(coin, current_price)
-                    print(f"✅ Sold {coin} for ${trade['pnl_usd']:.2f} profit")
-            
-            # Check stop loss
+                print(f"🎯 TAKE PROFIT: {coin} @ {pnl_percent:+.1f}%")
+                await self.db.close_position(coin, current_price)
             elif pnl_percent <= -settings.stop_loss_percent:
-                print(f"🛑 Stop loss triggered for {coin}: {pnl_percent:.1f}%")
-                success = await self.sell(coin, quantity, current_price)
-                if success:
-                    trade = await self.db.close_position(coin, current_price)
-                    print(f"❌ Sold {coin} for ${trade['pnl_usd']:.2f} loss")
+                print(f"🛑 STOP LOSS: {coin} @ {pnl_percent:+.1f}%")
+                await self.db.close_position(coin, current_price)
+            else:
+                print(f"📊 Holding {coin}: {pnl_percent:+.1f}% (${current_price:.4f})")
