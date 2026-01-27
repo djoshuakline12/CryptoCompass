@@ -1,17 +1,15 @@
 from database import Database
-from config import settings
 
 class AnomalyDetector:
     def __init__(self, db: Database):
         self.db = db
     
-    async def detect_signals(self) -> list[dict]:
+    async def detect_signals(self) -> list:
         mentions = await self.db.get_all_recent_mentions()
         
         if not mentions:
             return []
         
-        # Group by coin, keep best data
         coin_data = {}
         for m in mentions:
             coin = m.get("coin", "").upper()
@@ -29,28 +27,21 @@ class AnomalyDetector:
                     "best_source": source,
                     "best_count": count,
                     "market_cap": market_cap,
-                    "age_hours": age_hours,
-                    "sources": set()
+                    "age_hours": age_hours
                 }
             
-            # Accumulate count
             coin_data[coin]["total_count"] += count
-            coin_data[coin]["sources"].add(source)
             
-            # Keep the source with highest count
             if count > coin_data[coin]["best_count"]:
                 coin_data[coin]["best_source"] = source
                 coin_data[coin]["best_count"] = count
             
-            # Keep highest market cap found
             if market_cap > coin_data[coin]["market_cap"]:
                 coin_data[coin]["market_cap"] = market_cap
             
-            # Keep lowest age
             if age_hours < coin_data[coin]["age_hours"]:
                 coin_data[coin]["age_hours"] = age_hours
         
-        # Create signals
         signals = []
         for coin, data in coin_data.items():
             signal = {
@@ -60,17 +51,12 @@ class AnomalyDetector:
                 "percent_above_baseline": data["total_count"],
                 "source": data["best_source"],
                 "market_cap": data["market_cap"],
-                "age_hours": data["age_hours"],
-                "num_sources": len(data["sources"])
+                "age_hours": data["age_hours"]
             }
             signals.append(signal)
             await self.db.save_signal(signal)
         
-        # Sort by score
         signals.sort(key=lambda x: x["current_mentions"], reverse=True)
-        
-        print(f"🎯 Generated {len(signals)} signals")
-        for s in signals[:5]:
-            print(f"   {s['coin']}: score={s['current_mentions']}, source={s['source']}, mcap=${s['market_cap']:,.0f}")
+        print(f"🎯 {len(signals)} signals")
         
         return signals[:20]
