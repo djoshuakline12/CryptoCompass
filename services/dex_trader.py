@@ -43,6 +43,14 @@ class DexTrader:
                 self.solana_account = await self.cdp.solana.get_or_create_account(name=f"{account_name}-SOL")
                 self.solana_address = self.solana_account.address
                 print(f"✅ Solana account ready: {self.solana_address}")
+                
+                # Print available methods for debugging
+                methods = [m for m in dir(self.solana_account) if not m.startswith('_')]
+                print(f"   Account methods: {methods}")
+                
+                solana_methods = [m for m in dir(self.cdp.solana) if not m.startswith('_')]
+                print(f"   Solana client methods: {solana_methods}")
+                
                 self.chain = "solana"
             except Exception as e:
                 print(f"⚠️  Solana account error: {e}")
@@ -103,27 +111,40 @@ class DexTrader:
         return result
     
     async def swap_usdc_to_token(self, token_address: str, amount_usdc: float) -> dict:
-        """Swap USDC to a token using CDP"""
+        """Swap USDC to a token"""
         if not self.initialized:
             return {"success": False, "error": "DEX not initialized"}
         
         try:
             print(f"🔄 Solana swap: ${amount_usdc} USDC -> {token_address[:8]}...")
             
-            # Convert to smallest unit (USDC has 6 decimals)
             amount_raw = int(amount_usdc * 1e6)
             
-            # Use CDP's trade function directly - it handles routing
-            swap_result = await self.cdp.solana.trade(
-                address=self.solana_address,
-                from_token=USDC_SOLANA,
-                to_token=token_address,
-                amount=str(amount_raw),
-                slippage_bps=100  # 1% slippage
-            )
+            # Try account.trade first
+            if hasattr(self.solana_account, 'trade'):
+                swap_result = await self.solana_account.trade(
+                    from_token=USDC_SOLANA,
+                    to_token=token_address,
+                    amount=str(amount_raw),
+                    slippage_bps=100
+                )
+                print(f"✅ Swap executed via account.trade: {swap_result}")
+                return {"success": True, "result": str(swap_result)}
             
-            print(f"✅ Swap executed: {swap_result}")
-            return {"success": True, "result": str(swap_result)}
+            # Try account.swap
+            if hasattr(self.solana_account, 'swap'):
+                swap_result = await self.solana_account.swap(
+                    from_token=USDC_SOLANA,
+                    to_token=token_address,
+                    amount=str(amount_raw),
+                    slippage_bps=100
+                )
+                print(f"✅ Swap executed via account.swap: {swap_result}")
+                return {"success": True, "result": str(swap_result)}
+            
+            # List what we can do
+            methods = [m for m in dir(self.solana_account) if not m.startswith('_')]
+            return {"success": False, "error": f"No trade method. Available: {methods}"}
                 
         except Exception as e:
             print(f"❌ Swap error: {e}")
@@ -132,51 +153,61 @@ class DexTrader:
             return {"success": False, "error": str(e)}
     
     async def swap_token_to_usdc(self, token_address: str, amount_tokens: float = None) -> dict:
-        """Swap token back to USDC (sell)"""
+        """Swap token back to USDC"""
         if not self.initialized:
             return {"success": False, "error": "DEX not initialized"}
         
         try:
             print(f"🔄 Solana sell: {token_address[:8]}... -> USDC")
             
-            # Get token balance if not specified
-            if amount_tokens is None:
-                async with aiohttp.ClientSession() as session:
-                    payload = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "getTokenAccountsByOwner",
-                        "params": [
-                            self.solana_address,
-                            {"mint": token_address},
-                            {"encoding": "jsonParsed"}
-                        ]
-                    }
-                    async with session.post("https://api.mainnet-beta.solana.com", json=payload) as resp:
-                        data = await resp.json()
-                        accounts = data.get("result", {}).get("value", [])
-                        if not accounts:
-                            return {"success": False, "error": "No token balance"}
-                        
-                        info = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                        amount_raw = int(info.get("tokenAmount", {}).get("amount", 0))
-            else:
-                amount_raw = int(amount_tokens * 1e9)
+            # Get token balance
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [
+                        self.solana_address,
+                        {"mint": token_address},
+                        {"encoding": "jsonParsed"}
+                    ]
+                }
+                async with session.post("https://api.mainnet-beta.solana.com", json=payload) as resp:
+                    data = await resp.json()
+                    accounts = data.get("result", {}).get("value", [])
+                    if not accounts:
+                        return {"success": False, "error": "No token balance"}
+                    
+                    info = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                    amount_raw = int(info.get("tokenAmount", {}).get("amount", 0))
             
             if amount_raw == 0:
                 return {"success": False, "error": "No tokens to sell"}
             
-            # Use CDP's trade function directly
-            swap_result = await self.cdp.solana.trade(
-                address=self.solana_address,
-                from_token=token_address,
-                to_token=USDC_SOLANA,
-                amount=str(amount_raw),
-                slippage_bps=200  # 2% slippage for sells
-            )
+            # Try account.trade first
+            if hasattr(self.solana_account, 'trade'):
+                swap_result = await self.solana_account.trade(
+                    from_token=token_address,
+                    to_token=USDC_SOLANA,
+                    amount=str(amount_raw),
+                    slippage_bps=200
+                )
+                print(f"✅ Sell executed: {swap_result}")
+                return {"success": True, "result": str(swap_result)}
             
-            print(f"✅ Sell executed: {swap_result}")
-            return {"success": True, "result": str(swap_result)}
+            # Try account.swap
+            if hasattr(self.solana_account, 'swap'):
+                swap_result = await self.solana_account.swap(
+                    from_token=token_address,
+                    to_token=USDC_SOLANA,
+                    amount=str(amount_raw),
+                    slippage_bps=200
+                )
+                print(f"✅ Sell executed: {swap_result}")
+                return {"success": True, "result": str(swap_result)}
+            
+            methods = [m for m in dir(self.solana_account) if not m.startswith('_')]
+            return {"success": False, "error": f"No trade method. Available: {methods}"}
                 
         except Exception as e:
             print(f"❌ Sell error: {e}")
