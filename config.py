@@ -9,23 +9,24 @@ class Settings:
         self.buzz_threshold = 200
         self.take_profit_percent = 15
         self.stop_loss_percent = 8
-        self.live_trading = True
+        self.live_trading = True  # Default to live
         self.trading_enabled = True
         
-        self.starting_portfolio_usd = 19
+        self.starting_portfolio_usd = 22
         self.realized_pnl = 0
         self.max_open_positions = 3
         
         self.use_ai_sizing = True
         self.use_ai_smart_sell = True
         self.min_position_usd = 5
-        self.max_position_usd = 19
+        self.max_position_usd = 22
         
-        self.min_market_cap = 100_000
-        self.max_market_cap = 50_000_000
+        self.min_market_cap = 10_000
+        self.max_market_cap = 500_000_000
         
-        self.min_liquidity = 25_000
-        self.min_volume_24h = 50_000
+        # Very low thresholds to catch more trades
+        self.min_liquidity = 5_000
+        self.min_volume_24h = 500
         
         self.blacklisted_coins = set()
         self.cooldown_hours = 24
