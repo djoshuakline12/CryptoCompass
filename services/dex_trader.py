@@ -3,6 +3,7 @@ import aiohttp
 
 USDC_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 JUPITER_BASE = "https://public.jupiterapi.com"
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 class DexTrader:
     def __init__(self):
@@ -62,7 +63,7 @@ class DexTrader:
                         "method": "getBalance",
                         "params": [self.solana_address]
                     }
-                    async with session.post("https://api.mainnet-beta.solana.com", json=payload) as resp:
+                    async with session.post(SOLANA_RPC, json=payload) as resp:
                         data = await resp.json()
                         if "result" in data:
                             result["sol"] = data["result"].get("value", 0) / 1e9
@@ -77,7 +78,7 @@ class DexTrader:
                             {"encoding": "jsonParsed"}
                         ]
                     }
-                    async with session.post("https://api.mainnet-beta.solana.com", json=payload) as resp:
+                    async with session.post(SOLANA_RPC, json=payload) as resp:
                         data = await resp.json()
                         accounts = data.get("result", {}).get("value", [])
                         for acc in accounts:
@@ -90,34 +91,23 @@ class DexTrader:
         
         return result
     
-    async def swap_usdc_to_token(self, token_address: str, amount_usdc: float) -> dict:
-        """Swap USDC to a token via Jupiter + CDP signing"""
-        if not self.initialized:
-            return {"success": False, "error": "DEX not initialized"}
+    async def _execute_swap(self, session, input_mint: str, output_mint: str, amount_raw: int, slippage_bps: int = 100) -> dict:
+        """Execute a swap with retry logic for blockhash issues"""
         
-        try:
-            print(f"🔄 Solana swap: ${amount_usdc} USDC -> {token_address[:8]}...")
-            
-            amount_raw = int(amount_usdc * 1e6)
-            
-            async with aiohttp.ClientSession() as session:
-                # Get quote
-                quote_url = f"{JUPITER_BASE}/quote?inputMint={USDC_SOLANA}&outputMint={token_address}&amount={amount_raw}&slippageBps=100"
-                print(f"   Getting quote...")
+        for attempt in range(3):  # Retry up to 3 times
+            try:
+                # Get fresh quote
+                quote_url = f"{JUPITER_BASE}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_raw}&slippageBps={slippage_bps}"
                 
-                async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        print(f"   Quote error: {error_text[:100]}")
                         return {"success": False, "error": f"Quote failed: {resp.status}"}
                     quote = await resp.json()
                 
                 if "platformFee" in quote:
                     del quote["platformFee"]
                 
-                print(f"   Quote: {quote.get('outAmount', 'N/A')} tokens")
-                
-                # Try without shared accounts first (works for simple AMMs)
+                # Build swap - try without shared accounts first
                 for use_shared in [False, True]:
                     swap_request = {
                         "quoteResponse": quote,
@@ -127,28 +117,25 @@ class DexTrader:
                         "dynamicComputeUnitLimit": True,
                         "prioritizationFeeLamports": {
                             "priorityLevelWithMaxLamports": {
-                                "maxLamports": 1000000,
-                                "priorityLevel": "medium"
+                                "maxLamports": 2000000,
+                                "priorityLevel": "veryHigh"
                             }
                         }
                     }
                     
-                    print(f"   Building swap (shared={use_shared})...")
-                    async with session.post(f"{JUPITER_BASE}/swap", json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    async with session.post(f"{JUPITER_BASE}/swap", json=swap_request, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
                             swap_data = await resp.json()
                             break
-                        else:
+                        elif use_shared:
                             error_text = await resp.text()
-                            print(f"   Swap error: {error_text[:100]}")
-                            if use_shared:  # Last attempt failed
-                                return {"success": False, "error": f"Swap build failed"}
+                            return {"success": False, "error": f"Swap build failed: {error_text[:100]}"}
                 
                 swap_tx = swap_data.get("swapTransaction")
                 if not swap_tx:
                     return {"success": False, "error": "No swap transaction"}
                 
-                print(f"   Signing...")
+                # Sign immediately
                 signed = await self.solana_account.sign_transaction(swap_tx)
                 
                 if hasattr(signed, 'signed_transaction'):
@@ -158,143 +145,104 @@ class DexTrader:
                 else:
                     signed_tx = str(signed)
                 
-                print(f"   Sending...")
-                
-                # Send via Solana RPC
+                # Send with skipPreflight to avoid simulation delays
                 payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "sendTransaction",
-                    "params": [signed_tx, {"encoding": "base64"}]
+                    "params": [
+                        signed_tx, 
+                        {
+                            "encoding": "base64",
+                            "skipPreflight": True,
+                            "preflightCommitment": "processed",
+                            "maxRetries": 3
+                        }
+                    ]
                 }
-                async with session.post("https://api.mainnet-beta.solana.com", json=payload) as rpc_resp:
+                
+                async with session.post(SOLANA_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as rpc_resp:
                     rpc_data = await rpc_resp.json()
+                    
                     if "error" in rpc_data:
-                        print(f"   RPC error: {rpc_data['error']}")
-                        return {"success": False, "error": str(rpc_data["error"])}
-                    result = rpc_data.get("result")
-                
-                print(f"✅ Swap executed: {result}")
-                return {"success": True, "result": str(result)}
-                
-        except Exception as e:
-            print(f"❌ Swap error: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"success": False, "error": str(e)}
+                        error = rpc_data["error"]
+                        error_msg = error.get("message", str(error))
+                        
+                        # Retry on blockhash errors
+                        if "Blockhash not found" in error_msg or "BlockhashNotFound" in str(error):
+                            print(f"   Blockhash expired, retrying ({attempt + 1}/3)...")
+                            continue
+                        
+                        return {"success": False, "error": error_msg}
+                    
+                    return {"success": True, "result": rpc_data.get("result")}
+                    
+            except Exception as e:
+                if attempt < 2:
+                    print(f"   Error, retrying ({attempt + 1}/3): {e}")
+                    continue
+                return {"success": False, "error": str(e)}
+        
+        return {"success": False, "error": "Max retries exceeded"}
+    
+    async def swap_usdc_to_token(self, token_address: str, amount_usdc: float) -> dict:
+        """Swap USDC to a token"""
+        if not self.initialized:
+            return {"success": False, "error": "DEX not initialized"}
+        
+        print(f"🔄 Solana swap: ${amount_usdc} USDC -> {token_address[:8]}...")
+        amount_raw = int(amount_usdc * 1e6)
+        
+        async with aiohttp.ClientSession() as session:
+            result = await self._execute_swap(session, USDC_SOLANA, token_address, amount_raw, slippage_bps=100)
+            
+            if result["success"]:
+                print(f"✅ Swap executed: {result['result']}")
+            else:
+                print(f"❌ Swap failed: {result['error']}")
+            
+            return result
     
     async def swap_token_to_usdc(self, token_address: str, amount_tokens: float = None) -> dict:
         """Swap token back to USDC"""
         if not self.initialized:
             return {"success": False, "error": "DEX not initialized"}
         
-        try:
-            print(f"🔄 Solana sell: {token_address[:8]}... -> USDC")
+        print(f"🔄 Solana sell: {token_address[:8]}... -> USDC")
+        
+        async with aiohttp.ClientSession() as session:
+            # Get token balance
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    self.solana_address,
+                    {"mint": token_address},
+                    {"encoding": "jsonParsed"}
+                ]
+            }
+            async with session.post(SOLANA_RPC, json=payload) as resp:
+                data = await resp.json()
+                accounts = data.get("result", {}).get("value", [])
+                if not accounts:
+                    return {"success": False, "error": "No token balance"}
+                
+                info = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                amount_raw = int(info.get("tokenAmount", {}).get("amount", 0))
             
-            async with aiohttp.ClientSession() as session:
-                # Get token balance
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getTokenAccountsByOwner",
-                    "params": [
-                        self.solana_address,
-                        {"mint": token_address},
-                        {"encoding": "jsonParsed"}
-                    ]
-                }
-                async with session.post("https://api.mainnet-beta.solana.com", json=payload) as resp:
-                    data = await resp.json()
-                    accounts = data.get("result", {}).get("value", [])
-                    if not accounts:
-                        return {"success": False, "error": "No token balance"}
-                    
-                    info = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                    amount_raw = int(info.get("tokenAmount", {}).get("amount", 0))
-                
-                if amount_raw == 0:
-                    return {"success": False, "error": "Zero balance"}
-                
-                print(f"   Balance: {amount_raw} raw tokens")
-                
-                # Get quote with higher slippage for sells
-                quote_url = f"{JUPITER_BASE}/quote?inputMint={token_address}&outputMint={USDC_SOLANA}&amount={amount_raw}&slippageBps=500"
-                
-                async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        print(f"   Quote error ({resp.status}): {error_text[:150]}")
-                        return {"success": False, "error": f"Quote failed - token may have no liquidity"}
-                    quote = await resp.json()
-                
-                if "platformFee" in quote:
-                    del quote["platformFee"]
-                
-                out_amount = int(quote.get('outAmount', 0)) / 1e6
-                print(f"   Quote: ~${out_amount:.2f} USDC")
-                
-                # Try without shared accounts first
-                for use_shared in [False, True]:
-                    swap_request = {
-                        "quoteResponse": quote,
-                        "userPublicKey": self.solana_address,
-                        "wrapAndUnwrapSol": True,
-                        "useSharedAccounts": use_shared,
-                        "dynamicComputeUnitLimit": True,
-                        "prioritizationFeeLamports": {
-                            "priorityLevelWithMaxLamports": {
-                                "maxLamports": 1000000,
-                                "priorityLevel": "high"
-                            }
-                        }
-                    }
-                    
-                    print(f"   Building sell (shared={use_shared})...")
-                    async with session.post(f"{JUPITER_BASE}/swap", json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        if resp.status == 200:
-                            swap_data = await resp.json()
-                            break
-                        else:
-                            error_text = await resp.text()
-                            print(f"   Swap error: {error_text[:100]}")
-                            if use_shared:
-                                return {"success": False, "error": f"Swap build failed"}
-                
-                swap_tx = swap_data.get("swapTransaction")
-                if not swap_tx:
-                    return {"success": False, "error": "No swap transaction"}
-                
-                print(f"   Signing...")
-                signed = await self.solana_account.sign_transaction(swap_tx)
-                
-                if hasattr(signed, 'signed_transaction'):
-                    signed_tx = signed.signed_transaction
-                elif hasattr(signed, 'transaction'):
-                    signed_tx = signed.transaction
-                else:
-                    signed_tx = str(signed)
-                
-                print(f"   Sending...")
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "sendTransaction",
-                    "params": [signed_tx, {"encoding": "base64"}]
-                }
-                async with session.post("https://api.mainnet-beta.solana.com", json=payload) as rpc_resp:
-                    rpc_data = await rpc_resp.json()
-                    if "error" in rpc_data:
-                        print(f"   RPC error: {rpc_data['error']}")
-                        return {"success": False, "error": str(rpc_data["error"])}
-                    result = rpc_data.get("result")
-                
-                print(f"✅ Sell executed: {result}")
-                return {"success": True, "result": str(result)}
-                
-        except Exception as e:
-            print(f"❌ Sell error: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"success": False, "error": str(e)}
+            if amount_raw == 0:
+                return {"success": False, "error": "Zero balance"}
+            
+            print(f"   Selling {amount_raw} tokens...")
+            
+            result = await self._execute_swap(session, token_address, USDC_SOLANA, amount_raw, slippage_bps=300)
+            
+            if result["success"]:
+                print(f"✅ Sell executed: {result['result']}")
+            else:
+                print(f"❌ Sell failed: {result['error']}")
+            
+            return result
 
 dex_trader = DexTrader()
