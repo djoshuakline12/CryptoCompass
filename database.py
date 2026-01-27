@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from config import settings
 from typing import Optional
 
@@ -37,10 +37,36 @@ class Database:
             except:
                 pass
     
+    def _parse_datetime(self, dt_str: str) -> datetime:
+        """Parse datetime string and ensure it's timezone-aware UTC"""
+        if not dt_str:
+            return datetime.now(timezone.utc)
+        try:
+            dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except:
+            return datetime.now(timezone.utc)
+    
+    def _now_utc(self) -> datetime:
+        """Get current time as timezone-aware UTC"""
+        return datetime.now(timezone.utc)
+    
+    def _now_iso(self) -> str:
+        """Get current time as ISO string"""
+        return self._now_utc().isoformat()
+    
     async def update_mention_counts(self, mentions: list[dict]):
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = self._now_iso()
         for m in mentions:
             m["timestamp"] = timestamp
+        if self.client:
+            try:
+                for i in range(0, len(mentions), 50):
+                    self.client.table("mentions").insert(mentions[i:i+50]).execute()
+            except:
+                pass
         self._memory["mentions"].extend(mentions)
         self._memory["mentions"] = self._memory["mentions"][-1000:]
     
@@ -48,23 +74,38 @@ class Database:
         return self._memory.get("mentions", [])[-500:]
     
     async def save_signal(self, signal: dict):
-        signal["timestamp"] = datetime.utcnow().isoformat()
+        signal["timestamp"] = self._now_iso()
         self._memory["signals"].append(signal)
         self._memory["signals"] = self._memory["signals"][-100:]
     
     async def get_active_signals(self):
-        cutoff = datetime.utcnow() - timedelta(hours=2)
-        return [s for s in self._memory["signals"] if datetime.fromisoformat(s["timestamp"]) > cutoff]
-    
-    async def open_position(self, position: dict):
-        position["open_time"] = datetime.utcnow().isoformat()
-        position["status"] = "open"
-        position["coin"] = position["coin"].upper()
-        if self.client:
+        cutoff = self._now_utc() - timedelta(hours=2)
+        results = []
+        for s in self._memory["signals"]:
             try:
-                self.client.table("positions").insert({"coin": position["coin"], "quantity": position["quantity"], "buy_price": position["buy_price"], "status": "open"}).execute()
+                sig_time = self._parse_datetime(s.get("timestamp", ""))
+                if sig_time > cutoff:
+                    results.append(s)
             except:
                 pass
+        return results
+    
+    async def open_position(self, position: dict):
+        position["open_time"] = self._now_iso()
+        position["status"] = "open"
+        position["coin"] = position["coin"].upper()
+        
+        if self.client:
+            try:
+                self.client.table("positions").insert({
+                    "coin": position["coin"],
+                    "quantity": position["quantity"],
+                    "buy_price": position["buy_price"],
+                    "status": "open"
+                }).execute()
+            except:
+                pass
+        
         self._memory["positions"].append(position)
     
     async def get_open_positions(self):
@@ -87,22 +128,28 @@ class Database:
         if not position:
             return None
         
-        pnl_usd = (sell_price - position["buy_price"]) * position["quantity"]
-        pnl_percent = ((sell_price - position["buy_price"]) / position["buy_price"]) * 100 if position["buy_price"] else 0
-        hold_hours = (datetime.utcnow() - datetime.fromisoformat(position["open_time"])).total_seconds() / 3600
+        buy_price = position["buy_price"]
+        quantity = position["quantity"]
+        pnl_usd = (sell_price - buy_price) * quantity
+        pnl_percent = ((sell_price - buy_price) / buy_price) * 100 if buy_price else 0
+        
+        # Fix: Use timezone-aware datetime comparison
+        open_time = self._parse_datetime(position.get("open_time", ""))
+        now = self._now_utc()
+        hold_hours = (now - open_time).total_seconds() / 3600
         
         settings.add_realized_pnl(pnl_usd)
         
         trade = {
             "coin": coin,
-            "quantity": position["quantity"],
-            "buy_price": position["buy_price"],
+            "quantity": quantity,
+            "buy_price": buy_price,
             "sell_price": sell_price,
             "pnl_usd": round(pnl_usd, 2),
             "pnl_percent": round(pnl_percent, 2),
             "hold_hours": round(hold_hours, 2),
-            "buy_time": position["open_time"],
-            "sell_time": datetime.utcnow().isoformat(),
+            "buy_time": position.get("open_time", ""),
+            "sell_time": self._now_iso(),
             "sell_reason": sell_reason,
             "signal_source": position.get("signal", {}).get("source", "unknown")
         }
