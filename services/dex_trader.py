@@ -1,7 +1,11 @@
 import os
 import asyncio
+import aiohttp
 from datetime import datetime, timezone
 from config import settings
+
+USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_RPC = "https://mainnet.base.org"
 
 class DexTrader:
     def __init__(self):
@@ -48,39 +52,38 @@ class DexTrader:
             return False
     
     async def get_balances(self) -> dict:
-        if not self.initialized or not self.account:
-            return {"eth": 0, "usdc": 0, "error": "Not initialized"}
+        if not self.wallet_address:
+            return {"eth": 0, "usdc": 0, "error": "No wallet"}
         
         result = {"eth": 0, "usdc": 0}
         
         try:
-            balances = await self.account.list_balances()
-            print(f"Raw balances: {balances}")
-            
-            for b in balances:
-                print(f"  Balance item: {b}, type: {type(b)}")
-                if hasattr(b, 'asset'):
-                    asset = str(b.asset).lower()
-                    amount = float(b.amount) if hasattr(b, 'amount') else 0
-                    if 'eth' in asset:
-                        result["eth"] = amount
-                    elif 'usdc' in asset:
-                        result["usdc"] = amount
-                elif isinstance(b, dict):
-                    asset = str(b.get('asset', '')).lower()
-                    amount = float(b.get('amount', 0))
-                    if 'eth' in asset:
-                        result["eth"] = amount
-                    elif 'usdc' in asset:
-                        result["usdc"] = amount
-                        
-        except AttributeError:
-            try:
-                eth_bal = await self.account.balance(network="base")
-                result["eth"] = float(eth_bal) if eth_bal else 0
-            except Exception as e2:
-                print(f"ETH balance error: {e2}")
+            async with aiohttp.ClientSession() as session:
+                eth_payload = {
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBalance",
+                    "params": [self.wallet_address, "latest"],
+                    "id": 1
+                }
+                async with session.post(BASE_RPC, json=eth_payload) as resp:
+                    data = await resp.json()
+                    if "result" in data:
+                        wei = int(data["result"], 16)
+                        result["eth"] = wei / 1e18
                 
+                usdc_data = "0x70a08231" + self.wallet_address[2:].zfill(64)
+                usdc_payload = {
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{"to": USDC_BASE, "data": usdc_data}, "latest"],
+                    "id": 2
+                }
+                async with session.post(BASE_RPC, json=usdc_payload) as resp:
+                    data = await resp.json()
+                    if "result" in data and data["result"] != "0x":
+                        raw = int(data["result"], 16)
+                        result["usdc"] = raw / 1e6
+                        
         except Exception as e:
             print(f"Balance error: {e}")
             result["error"] = str(e)
