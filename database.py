@@ -17,11 +17,34 @@ class Database:
                 from supabase import create_client
                 self.client = create_client(settings.supabase_url, settings.supabase_key)
                 print("✅ Supabase connected")
+                self._load_realized_pnl()
+                self._load_open_positions()
             except Exception as e:
                 print(f"❌ Supabase error: {e}")
                 self.client = None
         else:
             print("⚠️  Using in-memory storage")
+    
+    def _load_realized_pnl(self):
+        if self.client:
+            try:
+                result = self.client.table("trades").select("pnl_usd").execute()
+                if result.data:
+                    total_pnl = sum(t.get("pnl_usd", 0) or 0 for t in result.data)
+                    settings.realized_pnl = total_pnl
+                    print(f"💰 Loaded historical P&L: ${total_pnl:.2f}")
+            except Exception as e:
+                print(f"Error loading P&L: {e}")
+    
+    def _load_open_positions(self):
+        if self.client:
+            try:
+                result = self.client.table("positions").select("*").eq("status", "open").execute()
+                if result.data:
+                    self._memory["positions"] = result.data
+                    print(f"📊 Loaded {len(result.data)} open positions")
+            except Exception as e:
+                print(f"Error loading positions: {e}")
     
     async def update_mention_counts(self, mentions: list[dict]):
         timestamp = datetime.utcnow().isoformat()
@@ -30,7 +53,10 @@ class Database:
         
         if self.client:
             try:
-                self.client.table("mentions").insert(mentions).execute()
+                batch_size = 50
+                for i in range(0, len(mentions), batch_size):
+                    batch = mentions[i:i+batch_size]
+                    self.client.table("mentions").insert(batch).execute()
             except Exception as e:
                 print(f"DB insert error: {e}")
         
@@ -75,6 +101,7 @@ class Database:
     async def open_position(self, position: dict):
         position["open_time"] = datetime.utcnow().isoformat()
         position["status"] = "open"
+        position["coin"] = position["coin"].upper()
         
         if self.client:
             try:
@@ -89,39 +116,38 @@ class Database:
                 print(f"DB position error: {e}")
         
         self._memory["positions"].append(position)
+        print(f"📝 Opened position: {position['coin']}")
     
     async def get_open_positions(self) -> list[dict]:
-        if self.client:
-            try:
-                result = self.client.table("positions").select("*").eq("status", "open").execute()
-                if result.data:
-                    return result.data
-            except Exception as e:
-                print(f"DB get positions error: {e}")
-        
         return [p for p in self._memory["positions"] if p.get("status") == "open"]
     
     async def has_open_position(self, coin: str) -> bool:
+        coin = coin.upper()
         positions = await self.get_open_positions()
-        return any(p["coin"] == coin for p in positions)
+        return any(p["coin"].upper() == coin for p in positions)
     
-    async def close_position(self, coin: str, sell_price: float):
+    async def close_position(self, coin: str, sell_price: float, sell_reason: str = "") -> Optional[dict]:
+        coin = coin.upper()
         position = None
+        
         for p in self._memory["positions"]:
-            if p["coin"] == coin and p.get("status") == "open":
+            if p["coin"].upper() == coin and p.get("status") == "open":
                 p["status"] = "closed"
                 position = p
                 break
         
         if not position:
+            print(f"⚠️ No open position found for {coin}")
             return None
         
         buy_price = position["buy_price"]
         quantity = position["quantity"]
         pnl_usd = (sell_price - buy_price) * quantity
-        pnl_percent = ((sell_price - buy_price) / buy_price) * 100
+        pnl_percent = ((sell_price - buy_price) / buy_price) * 100 if buy_price else 0
         open_time = datetime.fromisoformat(position["open_time"])
         hold_hours = (datetime.utcnow() - open_time).total_seconds() / 3600
+        
+        settings.add_realized_pnl(pnl_usd)
         
         trade = {
             "coin": coin,
@@ -132,7 +158,10 @@ class Database:
             "pnl_percent": round(pnl_percent, 2),
             "hold_hours": round(hold_hours, 2),
             "buy_time": position["open_time"],
-            "sell_time": datetime.utcnow().isoformat()
+            "sell_time": datetime.utcnow().isoformat(),
+            "sell_reason": sell_reason,
+            "risk_score": position.get("risk_score", 0),
+            "signal_source": position.get("signal", {}).get("source", "unknown")
         }
         
         if self.client:
@@ -143,6 +172,7 @@ class Database:
                 print(f"DB close position error: {e}")
         
         self._memory["trades"].append(trade)
+        print(f"📝 Closed position: {coin} | PnL: {pnl_percent:+.1f}%")
         return trade
     
     async def get_trade_history(self, limit: int = 50) -> list[dict]:

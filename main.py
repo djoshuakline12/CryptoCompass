@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
+import traceback
 from datetime import datetime
 
 from config import settings
@@ -29,7 +30,8 @@ async def background_loop():
             settings.record_successful_scan()
             await asyncio.sleep(120)
         except Exception as e:
-            print(f"Error in background loop: {e}")
+            print(f"Error: {e}")
+            traceback.print_exc()
             settings.record_error(str(e))
             await asyncio.sleep(60)
 
@@ -46,69 +48,103 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 @app.get("/")
 async def root():
-    return {"status": "running", "paper_trading": not settings.live_trading}
+    return {"status": "running", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/signals")
-async def get_signals() -> list[dict]:
-    signals = await db.get_active_signals()
-    for signal in signals:
-        if signal.get("market_cap", 0) == 0:
-            mc = await trader.get_market_cap(signal["coin"])
-            signal["market_cap"] = mc
-    return signals
+async def get_signals():
+    try:
+        signals = await db.get_active_signals()
+        for signal in signals:
+            try:
+                data = await trader.get_token_data(signal["coin"])
+                signal["market_cap"] = data["market_cap"]
+                signal["liquidity"] = data["liquidity"]
+                signal["volume_24h"] = data["volume_24h"]
+            except:
+                pass
+        return signals
+    except Exception as e:
+        print(f"Error in /signals: {e}")
+        return []
 
 @app.get("/positions")
-async def get_positions() -> list[dict]:
-    positions = await db.get_open_positions()
-    for pos in positions:
-        current_price = await trader.get_current_price(pos["coin"])
-        pos["current_price"] = current_price
-        pos["pnl_percent"] = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100 if pos["buy_price"] else 0
-        pos["pnl_usd"] = (current_price - pos["buy_price"]) * pos["quantity"] if pos["buy_price"] else 0
-    return positions
+async def get_positions():
+    try:
+        positions = await db.get_open_positions()
+        for pos in positions:
+            try:
+                data = await trader.get_token_data(pos["coin"])
+                pos["current_price"] = data["price"] if data["price"] > 0 else pos.get("buy_price", 0)
+                pos["liquidity"] = data.get("liquidity", 0)
+                pos["volume_24h"] = data.get("volume_24h", 0)
+                if pos["buy_price"] and pos["current_price"]:
+                    pos["pnl_percent"] = ((pos["current_price"] - pos["buy_price"]) / pos["buy_price"]) * 100
+                    pos["pnl_usd"] = (pos["current_price"] - pos["buy_price"]) * pos["quantity"]
+                else:
+                    pos["pnl_percent"] = 0
+                    pos["pnl_usd"] = 0
+            except Exception as e:
+                print(f"Error getting data for {pos['coin']}: {e}")
+                pos["current_price"] = pos.get("buy_price", 0)
+                pos["pnl_percent"] = 0
+                pos["pnl_usd"] = 0
+        return positions
+    except Exception as e:
+        print(f"Error in /positions: {e}")
+        traceback.print_exc()
+        return []
 
 @app.get("/history")
-async def get_history(limit: int = 50) -> list[dict]:
-    return await db.get_trade_history(limit)
+async def get_history(limit: int = 50):
+    try:
+        return await db.get_trade_history(limit)
+    except Exception as e:
+        print(f"Error in /history: {e}")
+        return []
 
 @app.get("/stats")
-async def get_stats() -> dict:
-    trades = await db.get_trade_history(limit=1000)
-    positions = await db.get_open_positions()
-    
-    capital_in_positions = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
-    unrealized_pnl = 0
-    for pos in positions:
-        current_price = await trader.get_current_price(pos["coin"])
-        unrealized_pnl += (current_price - pos["buy_price"]) * pos["quantity"]
-    
-    winners = [t for t in trades if t.get("pnl_percent", 0) > 0]
-    portfolio_change = ((settings.total_portfolio_usd + unrealized_pnl - settings.starting_portfolio_usd) / settings.starting_portfolio_usd) * 100
-    
-    return {
-        "total_realized_pnl": round(settings.realized_pnl, 2),
-        "total_unrealized_pnl": round(unrealized_pnl, 2),
-        "total_pnl": round(settings.realized_pnl + unrealized_pnl, 2),
-        "daily_pnl": round(settings.daily_pnl, 2),
-        "win_rate": round(len(winners) / len(trades) * 100, 1) if trades else 0,
-        "total_trades": len(trades),
-        "avg_hold_hours": round(sum(t.get("hold_hours", 0) for t in trades) / len(trades), 1) if trades else 0,
-        "open_positions": len(positions),
-        "starting_portfolio": settings.starting_portfolio_usd,
-        "current_portfolio": round(settings.total_portfolio_usd + unrealized_pnl, 2),
-        "portfolio_change_percent": round(portfolio_change, 2)
-    }
+async def get_stats():
+    try:
+        trades = await db.get_trade_history(limit=1000)
+        positions = await db.get_open_positions()
+        
+        unrealized = 0
+        for pos in positions:
+            try:
+                data = await trader.get_token_data(pos["coin"])
+                if data["price"]:
+                    unrealized += (data["price"] - pos["buy_price"]) * pos["quantity"]
+            except:
+                pass
+        
+        winners = [t for t in trades if t.get("pnl_percent", 0) > 0]
+        
+        return {
+            "total_realized_pnl": round(settings.realized_pnl, 2),
+            "total_unrealized_pnl": round(unrealized, 2),
+            "total_pnl": round(settings.realized_pnl + unrealized, 2),
+            "daily_pnl": round(settings.daily_pnl, 2),
+            "win_rate": round(len(winners) / len(trades) * 100, 1) if trades else 0,
+            "total_trades": len(trades),
+            "open_positions": len(positions),
+            "starting_portfolio": settings.starting_portfolio_usd,
+            "current_portfolio": round(settings.total_portfolio_usd + unrealized, 2)
+        }
+    except Exception as e:
+        print(f"Error in /stats: {e}")
+        return {"error": str(e)}
 
 @app.get("/settings")
-async def get_settings() -> dict:
+async def get_settings():
     return {
-        "buzz_threshold": settings.buzz_threshold,
         "take_profit_percent": settings.take_profit_percent,
         "stop_loss_percent": settings.stop_loss_percent,
         "max_position_usd": settings.max_position_usd,
@@ -117,207 +153,227 @@ async def get_settings() -> dict:
         "trading_enabled": settings.trading_enabled,
         "min_market_cap": settings.min_market_cap,
         "max_market_cap": settings.max_market_cap,
+        "min_liquidity": settings.min_liquidity,
+        "min_volume_24h": settings.min_volume_24h,
         "max_open_positions": settings.max_open_positions,
         "starting_portfolio_usd": settings.starting_portfolio_usd,
-        "total_portfolio_usd": settings.total_portfolio_usd,
-        "realized_pnl": settings.realized_pnl,
         "use_ai_sizing": settings.use_ai_sizing,
         "cooldown_hours": settings.cooldown_hours,
-        "max_daily_loss_usd": settings.max_daily_loss_usd,
-        "max_daily_loss_percent": settings.max_daily_loss_percent
+        "max_daily_loss_usd": settings.max_daily_loss_usd
     }
 
 @app.post("/settings")
-async def update_settings(new_settings: dict) -> dict:
-    if "buzz_threshold" in new_settings:
-        settings.buzz_threshold = new_settings["buzz_threshold"]
-    if "take_profit_percent" in new_settings:
-        settings.take_profit_percent = new_settings["take_profit_percent"]
-    if "stop_loss_percent" in new_settings:
-        settings.stop_loss_percent = new_settings["stop_loss_percent"]
-    if "max_position_usd" in new_settings:
-        settings.max_position_usd = new_settings["max_position_usd"]
-    if "min_position_usd" in new_settings:
-        settings.min_position_usd = new_settings["min_position_usd"]
-    if "paper_trading" in new_settings:
-        settings.live_trading = not new_settings["paper_trading"]
-    if "trading_enabled" in new_settings:
-        settings.trading_enabled = new_settings["trading_enabled"]
-    if "min_market_cap" in new_settings:
-        settings.min_market_cap = new_settings["min_market_cap"]
-    if "max_market_cap" in new_settings:
-        settings.max_market_cap = new_settings["max_market_cap"]
-    if "max_open_positions" in new_settings:
-        settings.max_open_positions = new_settings["max_open_positions"]
-    if "starting_portfolio_usd" in new_settings:
-        settings.starting_portfolio_usd = new_settings["starting_portfolio_usd"]
-    if "use_ai_sizing" in new_settings:
-        settings.use_ai_sizing = new_settings["use_ai_sizing"]
-    if "cooldown_hours" in new_settings:
-        settings.cooldown_hours = new_settings["cooldown_hours"]
-    if "max_daily_loss_usd" in new_settings:
-        settings.max_daily_loss_usd = new_settings["max_daily_loss_usd"]
-    if "max_daily_loss_percent" in new_settings:
-        settings.max_daily_loss_percent = new_settings["max_daily_loss_percent"]
-    return {"status": "updated"}
+async def update_settings(new: dict):
+    try:
+        for key in ["take_profit_percent", "stop_loss_percent", "max_position_usd", "min_position_usd", 
+                    "min_market_cap", "max_market_cap", "min_liquidity", "min_volume_24h",
+                    "max_open_positions", "starting_portfolio_usd", "cooldown_hours", "max_daily_loss_usd"]:
+            if key in new:
+                setattr(settings, key, new[key])
+        if "paper_trading" in new:
+            settings.live_trading = not new["paper_trading"]
+        if "trading_enabled" in new:
+            settings.trading_enabled = new["trading_enabled"]
+        if "use_ai_sizing" in new:
+            settings.use_ai_sizing = new["use_ai_sizing"]
+        return {"status": "updated"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.get("/trading/status")
-async def get_trading_status() -> dict:
-    positions = await db.get_open_positions()
-    capital_used = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
-    
-    return {
-        "trading_enabled": settings.trading_enabled,
-        "live_trading": settings.live_trading,
-        "open_positions": len(positions),
-        "max_positions": settings.max_open_positions,
-        "capital_deployed": round(capital_used, 2),
-        "capital_available": round(settings.total_portfolio_usd - capital_used, 2),
-        "current_portfolio": round(settings.total_portfolio_usd, 2),
-        "daily_pnl": round(settings.daily_pnl, 2),
-        "daily_loss_limit_hit": settings.is_daily_loss_limit_hit(),
-        "use_ai_sizing": settings.use_ai_sizing
-    }
+async def get_trading_status():
+    try:
+        positions = await db.get_open_positions()
+        capital_used = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
+        return {
+            "trading_enabled": settings.trading_enabled,
+            "live_trading": settings.live_trading,
+            "open_positions": len(positions),
+            "max_positions": settings.max_open_positions,
+            "capital_deployed": round(capital_used, 2),
+            "capital_available": round(settings.total_portfolio_usd - capital_used, 2),
+            "daily_pnl": round(settings.daily_pnl, 2),
+            "daily_loss_limit_hit": settings.is_daily_loss_limit_hit()
+        }
+    except Exception as e:
+        print(f"Error in /trading/status: {e}")
+        return {"error": str(e)}
 
 @app.get("/health")
-async def get_health() -> dict:
+async def get_health():
     return {
         "status": "critical" if settings.is_health_critical() else "healthy",
-        "last_successful_scan": settings.last_successful_scan.isoformat() if settings.last_successful_scan else None,
-        "consecutive_errors": settings.consecutive_errors,
-        "last_error": settings.last_error,
-        "daily_loss_limit_hit": settings.is_daily_loss_limit_hit(),
-        "daily_pnl": round(settings.daily_pnl, 2)
+        "last_scan": settings.last_successful_scan.isoformat() if settings.last_successful_scan else None,
+        "errors": settings.consecutive_errors
     }
 
 @app.get("/blacklist")
-async def get_blacklist() -> dict:
+async def get_blacklist():
     return {
-        "blacklisted_coins": list(settings.blacklisted_coins),
-        "cooldown_coins": {coin: expiry.isoformat() for coin, expiry in settings.cooldown_coins.items()}
+        "blacklisted": list(settings.blacklisted_coins),
+        "cooldowns": {c: e.isoformat() for c, e in settings.cooldown_coins.items()}
     }
 
 @app.post("/blacklist/add")
-async def add_to_blacklist(data: dict) -> dict:
-    coin = data.get("coin", "").upper()
-    reason = data.get("reason", "Manual blacklist")
-    
-    if not coin:
-        raise HTTPException(status_code=400, detail="Coin required")
-    
-    settings.blacklist_coin(coin, reason)
-    return {"status": "blacklisted", "coin": coin}
+async def add_blacklist(data: dict):
+    try:
+        coin = data.get("coin", "").upper()
+        if coin:
+            settings.blacklist_coin(coin)
+        return {"status": "ok", "coin": coin}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.post("/blacklist/remove")
-async def remove_from_blacklist(data: dict) -> dict:
-    coin = data.get("coin", "").upper()
-    
-    if not coin:
-        raise HTTPException(status_code=400, detail="Coin required")
-    
-    settings.unblacklist_coin(coin)
-    return {"status": "removed", "coin": coin}
+async def remove_blacklist(data: dict):
+    try:
+        coin = data.get("coin", "").upper()
+        if coin:
+            settings.unblacklist_coin(coin)
+        return {"status": "ok", "coin": coin}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.post("/cooldown/clear")
-async def clear_cooldown(data: dict) -> dict:
-    coin = data.get("coin", "").upper()
-    
-    if coin:
-        if coin in settings.cooldown_coins:
+async def clear_cooldown(data: dict):
+    try:
+        coin = data.get("coin", "").upper()
+        if coin and coin in settings.cooldown_coins:
             del settings.cooldown_coins[coin]
-        return {"status": "cleared", "coin": coin}
-    else:
-        settings.cooldown_coins = {}
-        return {"status": "all_cleared"}
+        elif not coin:
+            settings.cooldown_coins = {}
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.post("/trading/start")
 async def start_trading():
     settings.trading_enabled = True
-    return {"status": "trading started"}
+    return {"status": "started"}
 
 @app.post("/trading/stop")
 async def stop_trading():
     settings.trading_enabled = False
-    return {"status": "trading stopped"}
+    return {"status": "stopped"}
 
 @app.post("/trading/buy")
-async def manual_buy(data: dict) -> dict:
-    coin = data.get("coin", "").upper()
-    amount = data.get("amount", settings.max_position_usd)
-    
-    if not coin:
-        raise HTTPException(status_code=400, detail="Coin required")
-    
-    if settings.is_coin_blacklisted(coin):
-        raise HTTPException(status_code=400, detail=f"{coin} is blacklisted")
-    
-    if await db.has_open_position(coin):
-        raise HTTPException(status_code=400, detail=f"Already have position in {coin}")
-    
-    price = await trader.get_current_price(coin)
-    market_cap = await trader.get_market_cap(coin)
-    quantity = float(amount) / price
-    
-    await db.open_position({
-        "coin": coin,
-        "quantity": quantity,
-        "buy_price": price,
-        "position_usd": amount,
-        "market_cap": market_cap,
-        "signal": {"source": "manual"}
-    })
-    
-    return {"status": "bought", "coin": coin, "quantity": quantity, "price": price}
+async def manual_buy(data: dict):
+    try:
+        coin = data.get("coin", "").upper()
+        amount = float(data.get("amount", settings.max_position_usd))
+        
+        if not coin:
+            raise HTTPException(400, "Coin required")
+        
+        if settings.is_coin_blacklisted(coin):
+            raise HTTPException(400, f"{coin} is blacklisted")
+        
+        if await db.has_open_position(coin):
+            raise HTTPException(400, f"Already holding {coin}")
+        
+        token_data = await trader.get_token_data(coin)
+        if token_data["price"] == 0:
+            raise HTTPException(400, f"Can't get price for {coin}")
+        
+        quantity = amount / token_data["price"]
+        await db.open_position({
+            "coin": coin, 
+            "quantity": quantity, 
+            "buy_price": token_data["price"],
+            "position_usd": amount,
+            "market_cap": token_data["market_cap"],
+            "signal": {"source": "manual"}
+        })
+        
+        print(f"✅ MANUAL BUY: {quantity:.4f} {coin} @ ${token_data['price']:.6f}")
+        return {"status": "bought", "coin": coin, "quantity": quantity, "price": token_data["price"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in manual buy: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
 @app.post("/trading/sell")
-async def manual_sell(data: dict) -> dict:
-    coin = data.get("coin", "").upper()
-    
-    if not coin:
-        raise HTTPException(status_code=400, detail="Coin required")
-    
-    if not await db.has_open_position(coin):
-        raise HTTPException(status_code=400, detail=f"No open position for {coin}")
-    
-    price = await trader.get_current_price(coin)
-    trade = await db.close_position(coin, price, "Manual sell")
-    
-    return {"status": "sold", "coin": coin, "price": price, "pnl_percent": trade["pnl_percent"], "pnl_usd": trade["pnl_usd"]}
+async def manual_sell(data: dict):
+    try:
+        coin = data.get("coin", "").upper()
+        
+        if not coin:
+            raise HTTPException(400, "Coin required")
+        
+        print(f"📤 Attempting to sell {coin}")
+        
+        if not await db.has_open_position(coin):
+            raise HTTPException(400, f"No open position for {coin}")
+        
+        token_data = await trader.get_token_data(coin)
+        price = token_data["price"]
+        
+        if price == 0:
+            positions = await db.get_open_positions()
+            for p in positions:
+                if p["coin"] == coin:
+                    price = p["buy_price"]
+                    break
+        
+        if price == 0:
+            raise HTTPException(400, f"Can't determine price for {coin}")
+        
+        trade = await db.close_position(coin, price, "Manual sell")
+        
+        if trade is None:
+            raise HTTPException(500, "Failed to close position")
+        
+        print(f"✅ MANUAL SELL: {coin} @ ${price:.6f} | PnL: {trade['pnl_percent']:+.1f}%")
+        return {
+            "status": "sold", 
+            "coin": coin, 
+            "price": price, 
+            "pnl_percent": trade["pnl_percent"],
+            "pnl_usd": trade["pnl_usd"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in manual sell: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
 @app.post("/force-scan")
-async def force_scan() -> dict:
-    mentions = await scraper.scrape_all_sources()
-    await db.update_mention_counts(mentions)
-    signals = await detector.detect_signals()
-    return {"mentions_collected": len(mentions), "signals_found": len(signals)}
+async def force_scan():
+    try:
+        mentions = await scraper.scrape_all_sources()
+        await db.update_mention_counts(mentions)
+        signals = await detector.detect_signals()
+        return {"mentions": len(mentions), "signals": len(signals)}
+    except Exception as e:
+        print(f"Error in force-scan: {e}")
+        return {"error": str(e)}
 
 @app.get("/ai-insights")
-async def get_ai_insights() -> dict:
-    trades = await db.get_trade_history(limit=100)
-    
-    if len(trades) < 5:
-        return {"status": "Learning...", "trades_analyzed": len(trades), "recommendation": "Gather more data"}
-    
-    source_performance = {}
-    for trade in trades:
-        source = trade.get("signal_source", "unknown")
-        pnl = trade.get("pnl_percent", 0)
-        if source not in source_performance:
-            source_performance[source] = {"wins": 0, "total": 0}
-        source_performance[source]["total"] += 1
-        if pnl > 0:
-            source_performance[source]["wins"] += 1
-    
-    win_rates = {s: round(d["wins"]/d["total"]*100, 1) for s, d in source_performance.items() if d["total"] > 0}
-    best_source = max(win_rates, key=win_rates.get) if win_rates else "unknown"
-    
-    return {
-        "status": "Active",
-        "trades_analyzed": len(trades),
-        "best_source": best_source,
-        "win_rate_by_source": win_rates,
-        "recommendation": f"Focus on {best_source} signals"
-    }
+async def get_ai_insights():
+    try:
+        trades = await db.get_trade_history(100)
+        if len(trades) < 5:
+            return {"status": "Learning", "trades": len(trades)}
+        
+        sources = {}
+        for t in trades:
+            s = t.get("signal_source", "unknown")
+            if s not in sources:
+                sources[s] = {"wins": 0, "total": 0}
+            sources[s]["total"] += 1
+            if t.get("pnl_percent", 0) > 0:
+                sources[s]["wins"] += 1
+        
+        rates = {s: round(d["wins"]/d["total"]*100, 1) for s, d in sources.items() if d["total"] > 0}
+        best = max(rates, key=rates.get) if rates else "unknown"
+        
+        return {"status": "Active", "trades": len(trades), "best_source": best, "win_rates": rates}
+    except Exception as e:
+        print(f"Error in ai-insights: {e}")
+        return {"status": "Error", "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
