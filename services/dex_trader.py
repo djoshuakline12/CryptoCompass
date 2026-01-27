@@ -48,35 +48,24 @@ class DexTrader:
             traceback.print_exc()
             return False
     
-    async def get_balance(self, token: str = "ETH") -> float:
+    async def get_eth_balance(self) -> float:
         if not self.initialized or not self.account:
             return 0
         try:
-            if token.upper() == "ETH":
-                balance = await self.account.balance()
-                return float(balance) if balance else 0
-            return 0
+            balance = await self.account.balance()
+            return float(balance) if balance else 0
         except Exception as e:
-            print(f"Balance error: {e}")
+            print(f"ETH balance error: {e}")
             return 0
     
-    async def swap(self, from_token: str, to_token: str, amount: float) -> dict:
-        if not self.initialized:
-            return {"success": False, "error": "Not initialized"}
-        
+    async def get_usdc_balance(self) -> float:
+        if not self.initialized or not self.account:
+            return 0
         try:
-            result = await self.account.swap(
-                from_token=from_token,
-                to_token=to_token,
-                from_amount=str(int(amount * 1e18)),
-                slippage_bps=100
-            )
-            
-            print(f"✅ Swap complete: {result}")
-            return {"success": True, "result": str(result)}
-            
+            balance = await self.account.balance(token="usdc")
+            return float(balance) if balance else 0
         except Exception as e:
-            print(f"❌ Swap error: {e}")
-            return {"success": False, "error": str(e)}
+            print(f"USDC balance error: {e}")
+            return 0
 
 dex_trader = DexTrader()
