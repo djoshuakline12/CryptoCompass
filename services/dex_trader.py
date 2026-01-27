@@ -1,15 +1,9 @@
 import os
-import asyncio
 import aiohttp
-from datetime import datetime, timezone
 
 USDC_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
-
-JUPITER_ENDPOINTS = [
-    "https://public.jupiterapi.com",
-    "https://api.jup.ag/swap/v1",
-]
+JUPITER_BASE = "https://public.jupiterapi.com"
 
 class DexTrader:
     def __init__(self):
@@ -19,7 +13,6 @@ class DexTrader:
         self.solana_address = None
         self.wallet_address = None
         self.chain = "solana"
-        self.jupiter_base = "https://public.jupiterapi.com"
         
     async def initialize(self):
         if self.initialized:
@@ -73,8 +66,7 @@ class DexTrader:
                     async with session.post("https://api.mainnet-beta.solana.com", json=payload) as resp:
                         data = await resp.json()
                         if "result" in data:
-                            lamports = data["result"].get("value", 0)
-                            result["sol"] = lamports / 1e9
+                            result["sol"] = data["result"].get("value", 0) / 1e9
                     
                     payload = {
                         "jsonrpc": "2.0",
@@ -95,7 +87,6 @@ class DexTrader:
                             result["usdc"] = float(amount) if amount else 0
                         
         except Exception as e:
-            print(f"Balance error: {e}")
             result["error"] = str(e)
         
         return result
@@ -111,63 +102,55 @@ class DexTrader:
             amount_raw = int(amount_usdc * 1e6)
             
             async with aiohttp.ClientSession() as session:
-                # Step 1: Get quote
-                quote_url = f"{self.jupiter_base}/quote?inputMint={USDC_SOLANA}&outputMint={token_address}&amount={amount_raw}&slippageBps=100"
+                # Get quote WITHOUT platform fee
+                quote_url = f"{JUPITER_BASE}/quote?inputMint={USDC_SOLANA}&outputMint={token_address}&amount={amount_raw}&slippageBps=100"
                 print(f"   Getting quote...")
                 
                 async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        print(f"   Quote error: {error_text[:200]}")
                         return {"success": False, "error": f"Quote failed: {resp.status}"}
                     quote = await resp.json()
                 
-                out_amount = quote.get('outAmount', 'N/A')
-                print(f"   Quote: {out_amount} tokens")
+                # Remove any platform fee from quote if present
+                if "platformFee" in quote:
+                    del quote["platformFee"]
                 
-                # Step 2: Get swap transaction - try different formats
-                swap_url = f"{self.jupiter_base}/swap"
+                print(f"   Quote: {quote.get('outAmount', 'N/A')} tokens")
+                
+                # Build swap with NO fee
                 swap_request = {
                     "quoteResponse": quote,
                     "userPublicKey": self.solana_address,
                     "wrapAndUnwrapSol": True,
+                    "useSharedAccounts": True,
+                    "asLegacyTransaction": False,
+                    "useTokenLedger": False,
+                    "dynamicComputeUnitLimit": True,
+                    "skipUserAccountsRpcCalls": False,
+                    "prioritizationFeeLamports": {
+                        "priorityLevelWithMaxLamports": {
+                            "maxLamports": 1000000,
+                            "priorityLevel": "medium"
+                        }
+                    }
                 }
                 
-                print(f"   Building swap transaction...")
-                async with session.post(swap_url, json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    response_text = await resp.text()
+                print(f"   Building swap...")
+                async with session.post(f"{JUPITER_BASE}/swap", json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        print(f"   Swap error ({resp.status}): {response_text[:300]}")
-                        
-                        # Try alternative format
-                        print(f"   Trying alternative format...")
-                        swap_request2 = {
-                            "quote": quote,
-                            "userPublicKey": self.solana_address,
-                        }
-                        async with session.post(swap_url, json=swap_request2, timeout=aiohttp.ClientTimeout(total=15)) as resp2:
-                            response_text2 = await resp2.text()
-                            if resp2.status != 200:
-                                print(f"   Alt format error ({resp2.status}): {response_text2[:300]}")
-                                return {"success": False, "error": f"Swap build failed"}
-                            swap_data = await resp2.json() if 'json' in resp2.content_type else {"swapTransaction": response_text2}
-                    else:
-                        try:
-                            swap_data = await resp.json() if hasattr(resp, 'json') else {}
-                        except:
-                            swap_data = {"swapTransaction": response_text}
+                        error_text = await resp.text()
+                        print(f"   Swap error: {error_text[:200]}")
+                        return {"success": False, "error": f"Swap build failed: {resp.status}"}
+                    swap_data = await resp.json()
                 
                 swap_tx = swap_data.get("swapTransaction")
                 if not swap_tx:
-                    print(f"   Swap data keys: {swap_data.keys() if isinstance(swap_data, dict) else 'not dict'}")
-                    return {"success": False, "error": "No swap transaction in response"}
+                    return {"success": False, "error": "No swap transaction"}
                 
-                # Step 3: Sign with CDP
-                print(f"   Signing with CDP...")
+                print(f"   Signing...")
                 signed = await self.solana_account.sign_transaction(swap_tx)
                 
-                # Step 4: Send transaction
-                print(f"   Sending transaction...")
+                print(f"   Sending...")
                 signed_tx = signed.signed_transaction if hasattr(signed, 'signed_transaction') else str(signed)
                 result = await self.cdp.solana.send_transaction(
                     signed_transaction=signed_tx,
@@ -192,6 +175,7 @@ class DexTrader:
             print(f"🔄 Solana sell: {token_address[:8]}... -> USDC")
             
             async with aiohttp.ClientSession() as session:
+                # Get token balance
                 payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -215,26 +199,39 @@ class DexTrader:
                     return {"success": False, "error": "Zero balance"}
                 
                 # Get quote
-                quote_url = f"{self.jupiter_base}/quote?inputMint={token_address}&outputMint={USDC_SOLANA}&amount={amount_raw}&slippageBps=200"
+                quote_url = f"{JUPITER_BASE}/quote?inputMint={token_address}&outputMint={USDC_SOLANA}&amount={amount_raw}&slippageBps=200"
                 
                 async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         return {"success": False, "error": f"Quote failed: {resp.status}"}
                     quote = await resp.json()
                 
-                # Get swap transaction
-                swap_url = f"{self.jupiter_base}/swap"
+                if "platformFee" in quote:
+                    del quote["platformFee"]
+                
+                # Build swap
                 swap_request = {
                     "quoteResponse": quote,
                     "userPublicKey": self.solana_address,
                     "wrapAndUnwrapSol": True,
+                    "useSharedAccounts": True,
+                    "asLegacyTransaction": False,
+                    "useTokenLedger": False,
+                    "dynamicComputeUnitLimit": True,
+                    "skipUserAccountsRpcCalls": False,
+                    "prioritizationFeeLamports": {
+                        "priorityLevelWithMaxLamports": {
+                            "maxLamports": 1000000,
+                            "priorityLevel": "medium"
+                        }
+                    }
                 }
                 
-                async with session.post(swap_url, json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.post(f"{JUPITER_BASE}/swap", json=swap_request, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
                         print(f"   Sell error: {error_text[:200]}")
-                        return {"success": False, "error": f"Swap build failed: {resp.status}"}
+                        return {"success": False, "error": f"Swap build failed"}
                     swap_data = await resp.json()
                 
                 swap_tx = swap_data.get("swapTransaction")
