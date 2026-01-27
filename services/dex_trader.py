@@ -28,35 +28,40 @@ class DexTrader:
             print("✅ CDP SDK configured")
             
             wallet_id = os.getenv("CDP_WALLET_ID", "")
-            wallet_seed = os.getenv("CDP_WALLET_SEED", "")
             
-            if wallet_id and wallet_seed:
-                self.wallet = Wallet.import_data({
-                    "wallet_id": wallet_id,
-                    "seed": wallet_seed,
-                    "network_id": "base-mainnet"
-                })
-                print(f"✅ Loaded existing wallet: {wallet_id}")
+            if wallet_id:
+                self.wallet = await Wallet.fetch(wallet_id)
+                print(f"✅ Loaded wallet: {wallet_id}")
             else:
                 self.wallet = Wallet.create(network_id="base-mainnet")
-                data = self.wallet.export_data()
                 print(f"✅ Created new CDP wallet on Base")
-                print(f"   Wallet ID: {data['wallet_id']}")
+                print(f"   Wallet ID: {self.wallet.id}")
                 print(f"   Address: {self.wallet.default_address.address_id}")
-                print(f"   ⚠️  SAVE THESE TO RAILWAY ENV VARS:")
-                print(f"   CDP_WALLET_ID={data['wallet_id']}")
-                print(f"   CDP_WALLET_SEED={data['seed']}")
+                print(f"   ⚠️  ADD TO RAILWAY: CDP_WALLET_ID={self.wallet.id}")
             
             self.account = self.wallet.default_address
             self.initialized = True
             return True
             
+        except ImportError as e:
+            print(f"❌ CDP import error: {e}")
+            print("   Trying alternate import...")
+            try:
+                from cdp import CdpClient
+                print("   Found CdpClient - using async API")
+                self.initialized = False
+                return False
+            except:
+                pass
+            return False
         except Exception as e:
             print(f"❌ CDP init error: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     async def get_balance(self, token: str = "USDC") -> float:
-        if not self.initialized:
+        if not self.initialized or not self.wallet:
             return 0
         try:
             balances = self.wallet.balances()
