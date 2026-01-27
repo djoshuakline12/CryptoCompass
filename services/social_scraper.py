@@ -36,6 +36,7 @@ class SocialScraper:
             # Social monitoring
             self.scrape_twitter_via_nitter(),
             self.scrape_telegram_channels(),
+            self.scrape_reddit(),
             
             # Traditional sources
             self.scrape_coingecko_trending(),
@@ -62,6 +63,93 @@ class SocialScraper:
     
     # ============ SOCIAL MONITORING ============
     
+    async def scrape_reddit(self) -> list[dict]:
+        """Scrape crypto subreddits for ticker mentions"""
+        mentions = []
+        session = await self.get_session()
+        
+        subreddits = [
+            "cryptomoonshots",
+            "wallstreetbetscrypto", 
+            "SatoshiStreetBets",
+            "CryptoMars",
+            "memecoin",
+            "altcoin",
+        ]
+        
+        found_tickers = {}
+        
+        for subreddit in subreddits:
+            try:
+                url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=50"
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    headers={"User-Agent": "CryptoBuzzBot/1.0"}
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    
+                    data = await resp.json()
+                    posts = data.get("data", {}).get("children", [])
+                    
+                    for post in posts:
+                        post_data = post.get("data", {})
+                        title = post_data.get("title", "").upper()
+                        selftext = post_data.get("selftext", "").upper()
+                        score = post_data.get("score", 0)
+                        created = post_data.get("created_utc", 0)
+                        
+                        # Only look at recent posts (< 24h old)
+                        age_hours = (datetime.now().timestamp() - created) / 3600
+                        if age_hours > 24:
+                            continue
+                        
+                        combined_text = f"{title} {selftext}"
+                        
+                        # Extract $TICKER mentions
+                        tickers = re.findall(r'\$([A-Z]{2,10})\b', combined_text)
+                        
+                        # Also look for "X coin" or "X token" patterns
+                        token_patterns = re.findall(r'\b([A-Z]{2,8})\s+(?:COIN|TOKEN|CRYPTO|GEM)\b', combined_text)
+                        tickers.extend(token_patterns)
+                        
+                        for ticker in tickers:
+                            if ticker in ["USD", "USDT", "USDC", "BTC", "ETH", "THE", "FOR", "AND", "NOT", "THIS", "THAT", "SOL", "BNB", "NEW", "BUY", "SELL", "HOLD"]:
+                                continue
+                            if len(ticker) < 2 or len(ticker) > 8:
+                                continue
+                            
+                            # Weight by upvotes and recency
+                            weight = min(score + 10, 100) * (1 + (24 - age_hours) / 24)
+                            
+                            if ticker in found_tickers:
+                                found_tickers[ticker]["count"] += int(weight)
+                                found_tickers[ticker]["mentions"] += 1
+                            else:
+                                found_tickers[ticker] = {"count": int(weight), "mentions": 1, "subreddit": subreddit}
+                
+                await asyncio.sleep(0.5)  # Rate limit
+                
+            except Exception as e:
+                print(f"Reddit {subreddit} error: {e}")
+        
+        # Convert to mentions list, prioritize multiple mentions
+        for ticker, data in found_tickers.items():
+            if data["mentions"] >= 2 or data["count"] >= 50:
+                mentions.append({
+                    "coin": ticker,
+                    "source": f"reddit_{data['subreddit']}",
+                    "count": min(data["count"] + (data["mentions"] * 50), 500),
+                    "market_cap": 0
+                })
+                print(f"🔴 REDDIT: ${ticker} ({data['mentions']} posts, score {data['count']})")
+        
+        if not found_tickers:
+            print("⚠️ Reddit: No tickers found")
+        
+        return mentions
+    
     async def scrape_twitter_via_nitter(self) -> list[dict]:
         """Scrape crypto Twitter via Nitter"""
         mentions = []
@@ -69,7 +157,7 @@ class SocialScraper:
         
         nitter_instances = [
             "https://nitter.privacydev.net",
-            "https://nitter.poast.org", 
+            "https://nitter.poast.org",
             "https://nitter.1d4.us",
         ]
         
@@ -106,10 +194,9 @@ class SocialScraper:
         mentions = []
         session = await self.get_session()
         
-        # Popular crypto alpha channels (public)
         channels = [
             "cryptosignalalert",
-            "whale_alert_io", 
+            "whale_alert_io",
             "CryptoGemAlerts",
             "ulorangecrypto",
             "cryptobanter",
@@ -123,8 +210,6 @@ class SocialScraper:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), headers={"User-Agent": "Mozilla/5.0"}) as resp:
                     if resp.status == 200:
                         text = await resp.text()
-                        
-                        # Extract $TICKER and contract-related mentions
                         tickers = re.findall(r'\$([A-Z]{2,10})\b', text.upper())
                         ape_patterns = re.findall(r'(?:aping|buying|buy|long|bullish)\s+\$?([A-Z]{2,10})\b', text.upper())
                         tickers.extend(ape_patterns)
@@ -142,7 +227,7 @@ class SocialScraper:
                             print(f"📱 TELEGRAM: ${ticker}")
                         
                         await asyncio.sleep(0.5)
-            except Exception as e:
+            except:
                 continue
         
         if not found_tickers:
