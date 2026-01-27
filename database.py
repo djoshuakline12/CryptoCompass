@@ -38,7 +38,6 @@ class Database:
                 pass
     
     def _parse_datetime(self, dt_str: str) -> datetime:
-        """Parse datetime string and ensure it's timezone-aware UTC"""
         if not dt_str:
             return datetime.now(timezone.utc)
         try:
@@ -50,11 +49,9 @@ class Database:
             return datetime.now(timezone.utc)
     
     def _now_utc(self) -> datetime:
-        """Get current time as timezone-aware UTC"""
         return datetime.now(timezone.utc)
     
     def _now_iso(self) -> str:
-        """Get current time as ISO string"""
         return self._now_utc().isoformat()
     
     async def update_mention_counts(self, mentions: list[dict]):
@@ -133,7 +130,6 @@ class Database:
         pnl_usd = (sell_price - buy_price) * quantity
         pnl_percent = ((sell_price - buy_price) / buy_price) * 100 if buy_price else 0
         
-        # Fix: Use timezone-aware datetime comparison
         open_time = self._parse_datetime(position.get("open_time", ""))
         now = self._now_utc()
         hold_hours = (now - open_time).total_seconds() / 3600
