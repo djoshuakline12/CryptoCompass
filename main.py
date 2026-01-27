@@ -55,7 +55,6 @@ async def root():
 @app.get("/signals")
 async def get_signals() -> list[dict]:
     signals = await db.get_active_signals()
-    # Enrich with market cap if missing
     for signal in signals:
         if signal.get("market_cap", 0) == 0:
             mc = await trader.get_market_cap(signal["coin"])
@@ -81,26 +80,41 @@ async def get_stats() -> dict:
     trades = await db.get_trade_history(limit=1000)
     positions = await db.get_open_positions()
     
+    capital_in_positions = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
+    unrealized_pnl = 0
+    for pos in positions:
+        current_price = await trader.get_current_price(pos["coin"])
+        unrealized_pnl += (current_price - pos["buy_price"]) * pos["quantity"]
+    
     if not trades:
         return {
-            "total_pnl": 0,
+            "total_realized_pnl": settings.realized_pnl,
+            "total_unrealized_pnl": round(unrealized_pnl, 2),
+            "total_pnl": round(settings.realized_pnl + unrealized_pnl, 2),
             "win_rate": 0,
             "total_trades": 0,
             "avg_hold_hours": 0,
             "open_positions": len(positions),
-            "capital_deployed": sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
+            "starting_portfolio": settings.starting_portfolio_usd,
+            "current_portfolio": round(settings.total_portfolio_usd + unrealized_pnl, 2),
+            "portfolio_change_percent": 0
         }
     
     winners = [t for t in trades if t["pnl_percent"] > 0]
-    total_pnl = sum(t["pnl_usd"] for t in trades)
+    
+    portfolio_change = ((settings.total_portfolio_usd + unrealized_pnl - settings.starting_portfolio_usd) / settings.starting_portfolio_usd) * 100
     
     return {
-        "total_pnl": round(total_pnl, 2),
+        "total_realized_pnl": round(settings.realized_pnl, 2),
+        "total_unrealized_pnl": round(unrealized_pnl, 2),
+        "total_pnl": round(settings.realized_pnl + unrealized_pnl, 2),
         "win_rate": round(len(winners) / len(trades) * 100, 1),
         "total_trades": len(trades),
         "avg_hold_hours": round(sum(t["hold_hours"] for t in trades) / len(trades), 1),
         "open_positions": len(positions),
-        "capital_deployed": round(sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions), 2)
+        "starting_portfolio": settings.starting_portfolio_usd,
+        "current_portfolio": round(settings.total_portfolio_usd + unrealized_pnl, 2),
+        "portfolio_change_percent": round(portfolio_change, 2)
     }
 
 @app.get("/settings")
@@ -116,7 +130,9 @@ async def get_settings() -> dict:
         "min_market_cap": settings.min_market_cap,
         "max_market_cap": settings.max_market_cap,
         "max_open_positions": settings.max_open_positions,
+        "starting_portfolio_usd": settings.starting_portfolio_usd,
         "total_portfolio_usd": settings.total_portfolio_usd,
+        "realized_pnl": settings.realized_pnl,
         "use_ai_sizing": settings.use_ai_sizing
     }
 
@@ -142,8 +158,8 @@ async def update_settings(new_settings: dict) -> dict:
         settings.max_market_cap = new_settings["max_market_cap"]
     if "max_open_positions" in new_settings:
         settings.max_open_positions = new_settings["max_open_positions"]
-    if "total_portfolio_usd" in new_settings:
-        settings.total_portfolio_usd = new_settings["total_portfolio_usd"]
+    if "starting_portfolio_usd" in new_settings:
+        settings.starting_portfolio_usd = new_settings["starting_portfolio_usd"]
     if "use_ai_sizing" in new_settings:
         settings.use_ai_sizing = new_settings["use_ai_sizing"]
     return {"status": "updated"}
@@ -151,27 +167,30 @@ async def update_settings(new_settings: dict) -> dict:
 @app.get("/trading/status")
 async def get_trading_status() -> dict:
     positions = await db.get_open_positions()
-    capital_used = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
+    capital_in_positions = sum(p.get("buy_price", 0) * p.get("quantity", 0) for p in positions)
+    
     return {
         "trading_enabled": settings.trading_enabled,
         "live_trading": settings.live_trading,
         "open_positions": len(positions),
         "max_positions": settings.max_open_positions,
-        "capital_used": round(capital_used, 2),
-        "capital_available": round(settings.total_portfolio_usd - capital_used, 2),
-        "total_portfolio": settings.total_portfolio_usd,
+        "capital_deployed": round(capital_in_positions, 2),
+        "capital_available": round(settings.total_portfolio_usd - capital_in_positions, 2),
+        "starting_portfolio": settings.starting_portfolio_usd,
+        "current_portfolio": round(settings.total_portfolio_usd, 2),
+        "realized_pnl": round(settings.realized_pnl, 2),
         "use_ai_sizing": settings.use_ai_sizing
     }
 
 @app.post("/trading/start")
 async def start_trading():
     settings.trading_enabled = True
-    return {"status": "trading started", "trading_enabled": True}
+    return {"status": "trading started"}
 
 @app.post("/trading/stop")
 async def stop_trading():
     settings.trading_enabled = False
-    return {"status": "trading stopped", "trading_enabled": False}
+    return {"status": "trading stopped"}
 
 @app.post("/trading/buy")
 async def manual_buy(data: dict) -> dict:
@@ -197,8 +216,7 @@ async def manual_buy(data: dict) -> dict:
         "signal": {"source": "manual"}
     })
     
-    print(f"✅ MANUAL BUY: {quantity:.4f} {coin} @ ${price:.4f}")
-    return {"status": "bought", "coin": coin, "quantity": quantity, "price": price, "market_cap": market_cap}
+    return {"status": "bought", "coin": coin, "quantity": quantity, "price": price}
 
 @app.post("/trading/sell")
 async def manual_sell(data: dict) -> dict:
@@ -211,9 +229,8 @@ async def manual_sell(data: dict) -> dict:
         raise HTTPException(status_code=400, detail=f"No open position for {coin}")
     
     price = await trader.get_current_price(coin)
-    trade = await db.close_position(coin, price)
+    trade = await db.close_position(coin, price, "Manual sell")
     
-    print(f"✅ MANUAL SELL: {coin} @ ${price:.4f} | PnL: {trade['pnl_percent']:+.1f}%")
     return {"status": "sold", "coin": coin, "price": price, "pnl_percent": trade["pnl_percent"], "pnl_usd": trade["pnl_usd"]}
 
 @app.post("/force-scan")
@@ -232,16 +249,12 @@ async def get_ai_insights() -> dict:
             "status": "Learning...",
             "trades_analyzed": len(trades),
             "best_source": "Not enough data",
-            "avg_risk_score": 0,
-            "recommendation": "Gather more trade data for AI insights"
+            "recommendation": "Gather more trade data"
         }
     
     source_performance = {}
-    risk_performance = {"low": [], "medium": [], "high": []}
-    
     for trade in trades:
         source = trade.get("signal_source", "unknown")
-        risk = trade.get("risk_score", 50)
         pnl = trade.get("pnl_percent", 0)
         
         if source not in source_performance:
@@ -250,13 +263,6 @@ async def get_ai_insights() -> dict:
         source_performance[source]["pnl"] += pnl
         if pnl > 0:
             source_performance[source]["wins"] += 1
-        
-        if risk < 30:
-            risk_performance["low"].append(pnl)
-        elif risk < 60:
-            risk_performance["medium"].append(pnl)
-        else:
-            risk_performance["high"].append(pnl)
     
     win_rates = {s: round(d["wins"]/d["total"]*100, 1) for s, d in source_performance.items() if d["total"] > 0}
     best_source = max(win_rates, key=win_rates.get) if win_rates else "unknown"
@@ -266,12 +272,7 @@ async def get_ai_insights() -> dict:
         "trades_analyzed": len(trades),
         "best_source": best_source,
         "win_rate_by_source": win_rates,
-        "avg_pnl_by_risk": {
-            "low": round(sum(risk_performance["low"]) / len(risk_performance["low"]), 2) if risk_performance["low"] else 0,
-            "medium": round(sum(risk_performance["medium"]) / len(risk_performance["medium"]), 2) if risk_performance["medium"] else 0,
-            "high": round(sum(risk_performance["high"]) / len(risk_performance["high"]), 2) if risk_performance["high"] else 0
-        },
-        "recommendation": f"Focus on {best_source} signals" if best_source != "unknown" else "Continue gathering data"
+        "recommendation": f"Focus on {best_source} signals"
     }
 
 if __name__ == "__main__":
