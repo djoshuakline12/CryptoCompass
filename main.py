@@ -221,13 +221,13 @@ async def get_dex_status(user=Depends(verify_token)):
     if not dex_trader.initialized:
         return {"initialized": False, "error": "CDP not configured"}
     try:
-        eth = await dex_trader.get_eth_balance()
-        usdc = await dex_trader.get_usdc_balance()
+        balances = await dex_trader.get_balances()
         return {
             "initialized": True,
             "wallet_address": dex_trader.wallet_address,
-            "eth_balance": eth,
-            "usdc_balance": usdc
+            "eth_balance": balances.get("eth", 0),
+            "usdc_balance": balances.get("usdc", 0),
+            "debug": balances.get("error")
         }
     except Exception as e:
         return {"initialized": True, "wallet_address": dex_trader.wallet_address, "error": str(e)}

@@ -37,7 +37,6 @@ class DexTrader:
             
             self.wallet_address = self.account.address
             print(f"✅ Account ready on Base: {self.wallet_address}")
-            print(f"   Fund this address with ETH and USDC to enable live trading")
             
             self.initialized = True
             return True
@@ -48,24 +47,44 @@ class DexTrader:
             traceback.print_exc()
             return False
     
-    async def get_eth_balance(self) -> float:
+    async def get_balances(self) -> dict:
         if not self.initialized or not self.account:
-            return 0
+            return {"eth": 0, "usdc": 0, "error": "Not initialized"}
+        
+        result = {"eth": 0, "usdc": 0}
+        
         try:
-            balance = await self.account.balance()
-            return float(balance) if balance else 0
+            balances = await self.account.list_balances()
+            print(f"Raw balances: {balances}")
+            
+            for b in balances:
+                print(f"  Balance item: {b}, type: {type(b)}")
+                if hasattr(b, 'asset'):
+                    asset = str(b.asset).lower()
+                    amount = float(b.amount) if hasattr(b, 'amount') else 0
+                    if 'eth' in asset:
+                        result["eth"] = amount
+                    elif 'usdc' in asset:
+                        result["usdc"] = amount
+                elif isinstance(b, dict):
+                    asset = str(b.get('asset', '')).lower()
+                    amount = float(b.get('amount', 0))
+                    if 'eth' in asset:
+                        result["eth"] = amount
+                    elif 'usdc' in asset:
+                        result["usdc"] = amount
+                        
+        except AttributeError:
+            try:
+                eth_bal = await self.account.balance(network="base")
+                result["eth"] = float(eth_bal) if eth_bal else 0
+            except Exception as e2:
+                print(f"ETH balance error: {e2}")
+                
         except Exception as e:
-            print(f"ETH balance error: {e}")
-            return 0
-    
-    async def get_usdc_balance(self) -> float:
-        if not self.initialized or not self.account:
-            return 0
-        try:
-            balance = await self.account.balance(token="usdc")
-            return float(balance) if balance else 0
-        except Exception as e:
-            print(f"USDC balance error: {e}")
-            return 0
+            print(f"Balance error: {e}")
+            result["error"] = str(e)
+        
+        return result
 
 dex_trader = DexTrader()
