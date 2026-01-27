@@ -384,3 +384,60 @@ async def get_ai_insights(user=Depends(verify_token)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+@app.post("/dex/withdraw")
+async def withdraw_funds(data: dict, user=Depends(verify_token)):
+    """Withdraw SOL or USDC to an external wallet"""
+    try:
+        to_address = data.get("to_address")
+        amount = float(data.get("amount", 0))
+        token = data.get("token", "usdc").lower()  # "sol" or "usdc"
+        
+        if not to_address:
+            raise HTTPException(400, "to_address required")
+        if amount <= 0:
+            raise HTTPException(400, "amount must be > 0")
+        
+        if not dex_trader.initialized:
+            raise HTTPException(400, "DEX not initialized")
+        
+        if dex_trader.chain == "solana":
+            from cdp import CdpClient
+            
+            if token == "sol":
+                # Send SOL
+                result = await dex_trader.cdp.solana.transfer(
+                    from_address=dex_trader.solana_address,
+                    to_address=to_address,
+                    amount=str(int(amount * 1e9)),  # lamports
+                    token="sol"
+                )
+            else:
+                # Send USDC
+                USDC_SOLANA = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                result = await dex_trader.cdp.solana.transfer(
+                    from_address=dex_trader.solana_address,
+                    to_address=to_address,
+                    amount=str(int(amount * 1e6)),  # USDC has 6 decimals
+                    token=USDC_SOLANA
+                )
+            
+            return {"success": True, "result": str(result)}
+        else:
+            raise HTTPException(400, "Withdraw only supported for Solana currently")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Withdraw error: {e}")
+        raise HTTPException(500, str(e))
+
+@app.get("/dex/wallet-info")
+async def get_wallet_info(user=Depends(verify_token)):
+    """Get wallet addresses for deposits/withdrawals"""
+    return {
+        "chain": dex_trader.chain,
+        "solana_address": dex_trader.solana_address,
+        "base_address": dex_trader.wallet_address,
+        "note": "Use /dex/withdraw to send funds to your personal wallet"
+    }
