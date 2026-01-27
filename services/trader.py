@@ -271,4 +271,3 @@ class Trader:
                     settings.add_coin_cooldown(coin)
 
 # Import at top of file - adding to existing trader
-from services.smart_sell import should_sell, calculate_trailing_stop
