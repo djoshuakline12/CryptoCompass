@@ -127,13 +127,37 @@ async def get_stats(user=Depends(verify_token)):
     total_pnl = sum(h.get("pnl_usd", 0) or 0 for h in history)
     wins = [h for h in history if (h.get("pnl_usd") or 0) > 0]
     
+    # Calculate capital deployed in open positions
+    capital_deployed = sum(
+        (p.get("buy_price", 0) or 0) * (p.get("quantity", 0) or 0) 
+        for p in positions
+    )
+    
+    # Get actual USDC balance
+    balances = await dex_trader.get_balances()
+    capital_available = balances.get("usdc", 0)
+    
+    # Calculate unrealized PnL
+    unrealized_pnl = 0
+    for p in positions:
+        price = await trader.get_current_price(p["coin"])
+        if price and p.get("buy_price"):
+            unrealized_pnl += (price - p["buy_price"]) * p.get("quantity", 0)
+    
     return {
         "open_positions": len(positions),
         "total_trades": len(history),
         "total_pnl_usd": round(total_pnl, 2),
         "win_rate": round(len(wins) / len(history) * 100, 1) if history else 0,
-        "portfolio_value": settings.total_portfolio_usd,
-        "daily_pnl": settings.daily_pnl
+        "portfolio_value": round(capital_deployed + capital_available, 2),
+        "daily_pnl": round(settings.daily_pnl, 2),
+        "starting_capital": settings.starting_portfolio_usd,
+        "current_portfolio": round(capital_deployed + capital_available, 2),
+        "capital_deployed": round(capital_deployed, 2),
+        "capital_available": round(capital_available, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "realized_pnl": round(total_pnl, 2),
+        "max_positions": settings.max_open_positions
     }
 
 @app.get("/settings")
