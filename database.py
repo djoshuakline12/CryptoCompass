@@ -33,7 +33,11 @@ class Database:
             try:
                 result = self.client.table("positions").select("*").eq("status", "open").execute()
                 if result.data:
+                    for p in result.data:
+                        if "signal_source" in p and p["signal_source"]:
+                            p["signal"] = {"source": p["signal_source"]}
                     self._memory["positions"] = result.data
+                    print(f"📊 Loaded {len(result.data)} open positions")
             except:
                 pass
     
@@ -54,16 +58,10 @@ class Database:
     def _now_iso(self) -> str:
         return self._now_utc().isoformat()
     
-    async def update_mention_counts(self, mentions: list[dict]):
+    async def update_mention_counts(self, mentions: list):
         timestamp = self._now_iso()
         for m in mentions:
             m["timestamp"] = timestamp
-        if self.client:
-            try:
-                for i in range(0, len(mentions), 50):
-                    self.client.table("mentions").insert(mentions[i:i+50]).execute()
-            except:
-                pass
         self._memory["mentions"].extend(mentions)
         self._memory["mentions"] = self._memory["mentions"][-1000:]
     
@@ -92,21 +90,31 @@ class Database:
         position["status"] = "open"
         position["coin"] = position["coin"].upper()
         
+        signal_source = position.get("signal", {}).get("source", "unknown")
+        position["signal_source"] = signal_source
+        
         if self.client:
             try:
                 self.client.table("positions").insert({
                     "coin": position["coin"],
                     "quantity": position["quantity"],
                     "buy_price": position["buy_price"],
-                    "status": "open"
+                    "status": "open",
+                    "signal_source": signal_source,
+                    "open_time": position["open_time"]
                 }).execute()
-            except:
-                pass
+            except Exception as e:
+                print(f"DB position error: {e}")
         
         self._memory["positions"].append(position)
+        print(f"📝 Opened: {position['coin']} from {signal_source}")
     
     async def get_open_positions(self):
-        return [p for p in self._memory["positions"] if p.get("status") == "open"]
+        positions = [p for p in self._memory["positions"] if p.get("status") == "open"]
+        for p in positions:
+            if "signal" not in p or not p.get("signal"):
+                p["signal"] = {"source": p.get("signal_source", "unknown")}
+        return positions
     
     async def has_open_position(self, coin: str):
         coin = coin.upper()
@@ -131,10 +139,11 @@ class Database:
         pnl_percent = ((sell_price - buy_price) / buy_price) * 100 if buy_price else 0
         
         open_time = self._parse_datetime(position.get("open_time", ""))
-        now = self._now_utc()
-        hold_hours = (now - open_time).total_seconds() / 3600
+        hold_hours = (self._now_utc() - open_time).total_seconds() / 3600
         
         settings.add_realized_pnl(pnl_usd)
+        
+        signal_source = position.get("signal", {}).get("source") or position.get("signal_source", "unknown")
         
         trade = {
             "coin": coin,
@@ -147,7 +156,7 @@ class Database:
             "buy_time": position.get("open_time", ""),
             "sell_time": self._now_iso(),
             "sell_reason": sell_reason,
-            "signal_source": position.get("signal", {}).get("source", "unknown")
+            "signal_source": signal_source
         }
         
         if self.client:
@@ -158,6 +167,7 @@ class Database:
                 pass
         
         self._memory["trades"].append(trade)
+        print(f"📝 Closed: {coin} | PnL: {pnl_percent:+.1f}%")
         return trade
     
     async def get_trade_history(self, limit: int = 50):
