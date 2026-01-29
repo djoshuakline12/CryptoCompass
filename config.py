@@ -8,37 +8,36 @@ class Settings:
     def __init__(self):
         self.buzz_threshold = 200
         
-        # TIGHTER PROFIT/LOSS - factor in ~1% fees
-        self.take_profit_percent = 8    # Take profit faster
-        self.stop_loss_percent = 5      # Cut losses faster
+        # Tighter profit/loss - account for fees
+        self.take_profit_percent = 8
+        self.stop_loss_percent = 5
         
         self.live_trading = True
         self.trading_enabled = True
         
-        self.starting_portfolio_usd = 6  # Reset to actual value
+        self.starting_portfolio_usd = 6
         self.realized_pnl = 0
-        self.max_open_positions = 2      # Fewer positions, more concentrated
+        self.max_open_positions = 2
         
         self.use_ai_sizing = True
         self.use_ai_smart_sell = True
         self.min_position_usd = 1
-        self.max_position_usd = 3        # Smaller positions
+        self.max_position_usd = 3
         
-        # MUCH STRICTER FILTERS - avoid rugs
-        self.min_market_cap = 500_000    # $500k minimum (avoid micro scams)
-        self.max_market_cap = 50_000_000 # $50M max (still room to grow)
-        self.min_liquidity = 100_000     # $100k liquidity (can actually sell)
-        self.min_volume_24h = 50_000     # $50k volume (active trading)
+        # Strict filters
+        self.min_market_cap = 500_000
+        self.max_market_cap = 50_000_000
+        self.min_liquidity = 100_000
+        self.min_volume_24h = 50_000
         
         self.blacklisted_coins = set([
-            # Blacklist common scam names
-            "SOL", "ETH", "BTC", "USDC", "USDT", "HYPE", "BONK", "WIF", 
-            "JUP", "RAY", "ORCA"  # Don't trade legit tokens with imposters
+            "SOL", "ETH", "BTC", "USDC", "USDT", "HYPE", "BONK", "WIF",
+            "JUP", "RAY", "ORCA", "PYTH", "JTO", "MOBILE", "RENDER"
         ])
         
-        self.cooldown_hours = 48         # Longer cooldown
+        self.cooldown_hours = 48
         self.cooldown_coins = {}
-        self.max_daily_loss_usd = 2      # Stop trading after $2 loss
+        self.max_daily_loss_usd = 2
         self.max_daily_loss_percent = 30
         self.daily_pnl = 0
         self.daily_pnl_reset_date = datetime.now(timezone.utc).date()
@@ -48,8 +47,7 @@ class Settings:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
         
-        # Transaction cost estimate
-        self.estimated_fee_percent = 1.0  # ~1% round trip on Solana
+        self.estimated_fee_percent = 1.0
         
         self.exchange_api_key = os.getenv("EXCHANGE_API_KEY", "")
         self.exchange_api_secret = os.getenv("EXCHANGE_API_SECRET", "")
@@ -78,9 +76,7 @@ class Settings:
             self.daily_pnl = 0
             self.daily_pnl_reset_date = today
             return False
-        if self.daily_pnl <= -self.max_daily_loss_usd:
-            return True
-        return False
+        return self.daily_pnl <= -self.max_daily_loss_usd
     
     def is_coin_blacklisted(self, coin: str) -> bool:
         return coin.upper() in self.blacklisted_coins
