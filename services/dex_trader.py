@@ -30,11 +30,13 @@ class DexTrader:
             self.client = CdpClient(api_key_id=api_key, api_key_secret=api_secret)
             self.solana_client = SolanaClient(self.client.api_clients)
             
+            # Debug: check send_transaction signature
+            import inspect
             try:
-                self.solana_account = self.solana_client.get_account(address=self.solana_address)
-                print(f"✅ Got Solana account: {self.solana_address}")
+                sig = inspect.signature(self.solana_client.send_transaction)
+                print(f"🔍 send_transaction params: {list(sig.parameters.keys())}")
             except Exception as e:
-                print(f"⚠️ Account error: {e}")
+                print(f"🔍 Could not inspect: {e}")
             
             self.initialized = True
             print(f"✅ Solana ready: {self.solana_address}")
@@ -81,8 +83,6 @@ class DexTrader:
                 try:
                     async with aiohttp.ClientSession() as session:
                         amount_raw = int(amount_usdc * 1e6)
-                        
-                        # Quote WITHOUT any fee params
                         quote_url = f"https://public.jupiterapi.com/quote?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint={token_address}&amount={amount_raw}&slippageBps=300"
                         
                         async with session.get(quote_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -95,13 +95,11 @@ class DexTrader:
                             result["error"] = "No route found"
                             continue
                         
-                        # Remove any platformFee from quote if present
                         if "platformFee" in quote:
                             del quote["platformFee"]
                         
                         print(f"🔍 Quote: {amount_usdc} USDC -> {int(quote.get('outAmount', 0))} tokens")
                         
-                        # Swap with minimal body - no fees
                         swap_url = "https://public.jupiterapi.com/swap"
                         swap_body = {
                             "userPublicKey": self.solana_address,
@@ -121,13 +119,35 @@ class DexTrader:
                             result["error"] = "No transaction"
                             continue
                         
-                        print(f"🔍 Sending transaction via CDP...")
+                        print(f"🔍 Sending via CDP...")
                         
                         try:
-                            tx_result = self.solana_client.send_transaction(
-                                address=self.solana_address,
-                                transaction=tx_base64
-                            )
+                            # Try different method signatures
+                            tx_result = None
+                            
+                            # Try 1: Just transaction
+                            try:
+                                tx_result = self.solana_client.send_transaction(tx_base64)
+                            except TypeError:
+                                pass
+                            
+                            # Try 2: transaction as keyword
+                            if tx_result is None:
+                                try:
+                                    tx_result = self.solana_client.send_transaction(transaction=tx_base64)
+                                except TypeError:
+                                    pass
+                            
+                            # Try 3: With address as positional
+                            if tx_result is None:
+                                try:
+                                    tx_result = self.solana_client.send_transaction(self.solana_address, tx_base64)
+                                except TypeError:
+                                    pass
+                            
+                            if tx_result is None:
+                                result["error"] = "Could not call send_transaction"
+                                continue
                             
                             if asyncio.iscoroutine(tx_result):
                                 tx_result = await tx_result
@@ -149,9 +169,6 @@ class DexTrader:
                         except Exception as e:
                             print(f"❌ CDP error: {e}")
                             result["error"] = str(e)[:100]
-                            if "blockhash" in str(e).lower():
-                                await asyncio.sleep(1)
-                                continue
                         
                 except asyncio.TimeoutError:
                     result["error"] = f"Timeout {attempt + 1}"
@@ -223,8 +240,7 @@ class DexTrader:
                         
                         async with session.post(swap_url, json=swap_body, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                             if resp.status != 200:
-                                resp_text = await resp.text()
-                                result["error"] = f"Swap: {resp_text[:80]}"
+                                result["error"] = f"Swap: {resp.status}"
                                 continue
                             swap_data = await resp.json()
                         
@@ -234,10 +250,14 @@ class DexTrader:
                             continue
                         
                         try:
-                            tx_result = self.solana_client.send_transaction(
-                                address=self.solana_address,
-                                transaction=tx_base64
-                            )
+                            tx_result = None
+                            try:
+                                tx_result = self.solana_client.send_transaction(tx_base64)
+                            except TypeError:
+                                try:
+                                    tx_result = self.solana_client.send_transaction(transaction=tx_base64)
+                                except TypeError:
+                                    tx_result = self.solana_client.send_transaction(self.solana_address, tx_base64)
                             
                             if asyncio.iscoroutine(tx_result):
                                 tx_result = await tx_result
@@ -253,9 +273,6 @@ class DexTrader:
                             
                         except Exception as e:
                             result["error"] = str(e)[:100]
-                            if "blockhash" in str(e).lower():
-                                await asyncio.sleep(1)
-                                continue
                         
                 except asyncio.TimeoutError:
                     result["error"] = f"Timeout {attempt + 1}"
