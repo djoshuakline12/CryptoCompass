@@ -11,15 +11,39 @@ class DexTrader:
         self.solana_address = None
         self.chain = "solana"
         self.last_trade_time = None
-        self.min_trade_interval = 5  # Seconds between trades
-        
-        # Track pending trades to prevent duplicates
+        self.min_trade_interval = 5
         self.pending_trades = set()
     
     async def initialize(self):
         """Initialize CDP wallet"""
         try:
-            from cdp import Cdp, Wallet
+            # Try different import patterns for CDP SDK
+            try:
+                from cdp import Cdp, Wallet
+            except ImportError:
+                try:
+                    from cdp.client import Cdp
+                    from cdp.wallet import Wallet
+                except ImportError:
+                    try:
+                        from coinbase_sdk import Cdp, Wallet
+                    except ImportError:
+                        # Try to see what's available
+                        import cdp
+                        print(f"CDP module contents: {dir(cdp)}")
+                        
+                        # Try common patterns
+                        if hasattr(cdp, 'CDP'):
+                            Cdp = cdp.CDP
+                        elif hasattr(cdp, 'Client'):
+                            Cdp = cdp.Client
+                        else:
+                            raise ImportError(f"Cannot find Cdp class. Available: {dir(cdp)}")
+                        
+                        if hasattr(cdp, 'Wallet'):
+                            Wallet = cdp.Wallet
+                        else:
+                            raise ImportError(f"Cannot find Wallet class. Available: {dir(cdp)}")
             
             api_key = os.getenv("CDP_API_KEY_NAME")
             api_secret = os.getenv("CDP_API_KEY_PRIVATE_KEY", "").replace("\\n", "\n")
@@ -50,8 +74,12 @@ class DexTrader:
             return balances
         
         try:
+            helius_key = os.getenv('HELIUS_API_KEY', '')
+            if not helius_key:
+                return balances
+                
             async with aiohttp.ClientSession() as session:
-                url = f"https://api.helius.xyz/v0/addresses/{self.solana_address}/balances?api-key={os.getenv('HELIUS_API_KEY', '')}"
+                url = f"https://api.helius.xyz/v0/addresses/{self.solana_address}/balances?api-key={helius_key}"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -70,22 +98,18 @@ class DexTrader:
         return balances
     
     async def swap_usdc_to_token(self, token_address: str, amount_usdc: float, max_retries: int = 3) -> dict:
-        """
-        Swap USDC to token with retry logic and duplicate prevention
-        """
+        """Swap USDC to token with retry logic"""
         result = {"success": False, "tx_hash": "", "error": ""}
         
         if not self.initialized:
             result["error"] = "DEX not initialized"
             return result
         
-        # Prevent duplicate trades
         trade_key = f"buy_{token_address}"
         if trade_key in self.pending_trades:
             result["error"] = "Trade already pending"
             return result
         
-        # Rate limit
         if self.last_trade_time:
             elapsed = (datetime.now(timezone.utc) - self.last_trade_time).total_seconds()
             if elapsed < self.min_trade_interval:
@@ -96,7 +120,6 @@ class DexTrader:
         try:
             for attempt in range(max_retries):
                 try:
-                    # Get fresh quote
                     async with aiohttp.ClientSession() as session:
                         amount_raw = int(amount_usdc * 1e6)
                         quote_url = f"https://public.jupiterapi.com/quote?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint={token_address}&amount={amount_raw}&slippageBps=200"
@@ -111,13 +134,12 @@ class DexTrader:
                             result["error"] = "No route found"
                             continue
                         
-                        # Build transaction
                         swap_url = "https://public.jupiterapi.com/swap"
                         swap_body = {
                             "userPublicKey": self.solana_address,
                             "quoteResponse": quote,
                             "dynamicComputeUnitLimit": True,
-                            "prioritizationFeeLamports": 2000000  # 0.002 SOL priority
+                            "prioritizationFeeLamports": 2000000
                         }
                         
                         async with session.post(swap_url, json=swap_body, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -130,20 +152,14 @@ class DexTrader:
                             result["error"] = "No transaction returned"
                             continue
                         
-                        # Sign and send
                         tx_base64 = swap_data["swapTransaction"]
-                        
                         signed = self.wallet.default_address.sign_transaction(tx_base64)
                         
-                        # Send with skipPreflight for speed
                         send_body = {
                             "jsonrpc": "2.0",
                             "id": 1,
                             "method": "sendTransaction",
-                            "params": [
-                                signed,
-                                {"skipPreflight": True, "maxRetries": 3}
-                            ]
+                            "params": [signed, {"skipPreflight": True, "maxRetries": 3}]
                         }
                         
                         rpc_url = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -153,7 +169,6 @@ class DexTrader:
                         if "error" in send_result:
                             error_msg = str(send_result["error"])
                             if "blockhash" in error_msg.lower():
-                                print(f"Blockhash expired, retry {attempt + 1}")
                                 await asyncio.sleep(1)
                                 continue
                             result["error"] = error_msg[:100]
@@ -170,23 +185,19 @@ class DexTrader:
                 except Exception as e:
                     result["error"] = str(e)[:100]
                     await asyncio.sleep(2)
-        
         finally:
             self.pending_trades.discard(trade_key)
         
         return result
     
     async def swap_token_to_usdc(self, token_address: str, max_retries: int = 3) -> dict:
-        """
-        Swap ALL of a token to USDC with retry logic
-        """
+        """Swap ALL of a token to USDC"""
         result = {"success": False, "tx_hash": "", "error": ""}
         
         if not self.initialized:
             result["error"] = "DEX not initialized"
             return result
         
-        # Prevent duplicate sells
         trade_key = f"sell_{token_address}"
         if trade_key in self.pending_trades:
             result["error"] = "Sell already pending"
@@ -195,19 +206,17 @@ class DexTrader:
         self.pending_trades.add(trade_key)
         
         try:
-            # Get token balance
             token_balance = 0
-            decimals = 9
             
             async with aiohttp.ClientSession() as session:
-                url = f"https://api.helius.xyz/v0/addresses/{self.solana_address}/balances?api-key={os.getenv('HELIUS_API_KEY', '')}"
+                helius_key = os.getenv('HELIUS_API_KEY', '')
+                url = f"https://api.helius.xyz/v0/addresses/{self.solana_address}/balances?api-key={helius_key}"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         for token in data.get("tokens", []):
                             if token.get("mint") == token_address:
                                 token_balance = int(token.get("amount", 0))
-                                decimals = token.get("decimals", 9)
                                 break
             
             if token_balance == 0:
@@ -224,7 +233,7 @@ class DexTrader:
                                 error_text = await resp.text()
                                 if "route" in error_text.lower():
                                     result["error"] = "No liquidity to sell"
-                                    return result  # Don't retry - no route won't change
+                                    return result
                                 result["error"] = f"Quote failed: {resp.status}"
                                 continue
                             quote = await resp.json()
@@ -268,7 +277,6 @@ class DexTrader:
                         if "error" in send_result:
                             error_msg = str(send_result["error"])
                             if "blockhash" in error_msg.lower():
-                                print(f"Blockhash expired, retry {attempt + 1}")
                                 await asyncio.sleep(1)
                                 continue
                             result["error"] = error_msg[:100]
@@ -285,7 +293,6 @@ class DexTrader:
                 except Exception as e:
                     result["error"] = str(e)[:100]
                     await asyncio.sleep(2)
-        
         finally:
             self.pending_trades.discard(trade_key)
         
