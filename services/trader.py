@@ -13,6 +13,7 @@ from services.signal_sources import signal_sources
 from services.pumpfun_scanner import pumpfun_scanner
 from services.dev_tracker import dev_tracker
 from services.tx_simulator import tx_simulator
+from services.trade_safety import trade_safety
 
 class Trader:
     def __init__(self, db: Database):
@@ -437,7 +438,13 @@ class Trader:
             print(f"{tier} {coin} Score:{signal_score} | {reason}")
             
             if settings.live_trading and dex_trader.initialized:
-                print(f"🔄 BUY ${position_usd:.2f} {coin}")
+                # Validate trade safety
+            safety = await trade_safety.validate_trade(contract, position_usd, is_buy=True)
+            if not safety["should_proceed"]:
+                print(f"⛔ {coin}: Trade unsafe - {', '.join(safety['warnings'])}")
+                continue
+            
+            print(f"🔄 BUY ${position_usd:.2f} {coin}")
                 result = await dex_trader.swap_usdc_to_token(contract, position_usd)
                 
                 if not result["success"]:

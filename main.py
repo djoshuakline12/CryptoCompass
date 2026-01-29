@@ -60,7 +60,13 @@ async def lifespan(app: FastAPI):
     # Start both loops
     asyncio.create_task(signal_scan_loop())
     asyncio.create_task(position_monitor_loop())
-    print("🚀 Trading loops started (signals: 30s, positions: 5s)")
+    print("🚀 Trading loops started')
+    
+    # Sync wallet on startup
+    from services.wallet_sync import wallet_sync
+    sync_result = await wallet_sync.sync_positions(dex_trader.solana_address, db)
+    if sync_result["synced"] > 0:
+        print(f'📥 Synced {sync_result["synced"]} orphan positions worth ${sync_result["total_orphan_value"]:.2f} (signals: 30s, positions: 5s)")
     
     yield
     
