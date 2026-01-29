@@ -16,16 +16,12 @@ class DexTrader:
         self.pending_trades = set()
     
     async def initialize(self):
-        """Initialize CDP wallet with new SDK"""
+        """Initialize CDP wallet"""
         try:
-            # Debug: print available env vars (names only, not values)
-            cdp_vars = [k for k in os.environ.keys() if 'CDP' in k.upper() or 'WALLET' in k.upper() or 'SOLANA' in k.upper()]
-            print(f"🔍 Available env vars: {cdp_vars}")
-            
-            # Try multiple possible env var names
-            api_key = os.getenv("CDP_API_KEY_NAME") or os.getenv("CDP_API_KEY") or os.getenv("COINBASE_API_KEY")
-            api_secret = (os.getenv("CDP_API_KEY_PRIVATE_KEY") or os.getenv("CDP_PRIVATE_KEY") or os.getenv("COINBASE_PRIVATE_KEY") or "").replace("\\n", "\n")
-            wallet_data = os.getenv("CDP_WALLET_DATA") or os.getenv("WALLET_DATA")
+            # Use correct env var names
+            api_key = os.getenv("CDP_API_KEY_NAME")
+            api_secret = os.getenv("CDP_API_KEY_SECRET", "").replace("\\n", "\n")
+            wallet_data = os.getenv("CDP_WALLET_SECRET")
             
             print(f"🔍 api_key exists: {bool(api_key)}")
             print(f"🔍 api_secret exists: {bool(api_secret)}")
@@ -33,68 +29,51 @@ class DexTrader:
             
             if not api_key or not api_secret:
                 print("❌ Missing CDP API credentials")
-                # Try to continue with just wallet address for read-only mode
-                if wallet_data:
-                    try:
-                        data = json.loads(wallet_data)
-                        print(f"🔍 wallet_data keys: {list(data.keys())}")
-                        
-                        # Extract address from various possible formats
-                        if "default_address" in data:
-                            addr = data["default_address"]
-                            if isinstance(addr, dict):
-                                self.solana_address = addr.get("address_id") or addr.get("address")
-                            else:
-                                self.solana_address = addr
-                        elif "address" in data:
-                            self.solana_address = data["address"]
-                        elif "wallet_id" in data:
-                            # Old format - need to find address differently
-                            print(f"🔍 Old wallet format detected")
-                        
-                        if self.solana_address:
-                            print(f"✅ Read-only mode: {self.solana_address}")
-                            self.initialized = True
-                            return True
-                    except Exception as e:
-                        print(f"Wallet parse error: {e}")
-                
                 return False
             
-            # Full initialization with signing capability
-            from cdp import CdpClient
+            if not wallet_data:
+                print("❌ Missing wallet data")
+                return False
             
+            # Parse wallet data
+            data = json.loads(wallet_data)
+            print(f"🔍 wallet_data keys: {list(data.keys())}")
+            
+            # Extract address from wallet data
+            if "default_address" in data:
+                addr = data["default_address"]
+                if isinstance(addr, dict):
+                    self.solana_address = addr.get("address_id") or addr.get("address")
+                else:
+                    self.solana_address = addr
+            elif "address" in data:
+                self.solana_address = data["address"]
+            
+            if not self.solana_address:
+                print(f"❌ Could not find address in wallet data. Keys: {list(data.keys())}")
+                # Print more details to debug
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        print(f"🔍 {k}: {list(v.keys())}")
+                    else:
+                        print(f"🔍 {k}: {type(v).__name__}")
+                return False
+            
+            # Initialize CDP client
+            from cdp import CdpClient
             self.client = CdpClient(api_key_id=api_key, api_key_secret=api_secret)
             
-            if wallet_data:
-                data = json.loads(wallet_data)
-                print(f"🔍 wallet_data keys: {list(data.keys())}")
-                
-                # Try to get address
-                if "default_address" in data:
-                    addr = data["default_address"]
-                    if isinstance(addr, dict):
-                        self.solana_address = addr.get("address_id") or addr.get("address")
-                    else:
-                        self.solana_address = addr
-                elif "address" in data:
-                    self.solana_address = data["address"]
-                
-                # Try to import account for signing
-                try:
-                    from cdp.solana_account import SolanaAccount
-                    # Check what import methods are available
-                    print(f"🔍 SolanaAccount methods: {[m for m in dir(SolanaAccount) if not m.startswith('_')]}")
-                except Exception as e:
-                    print(f"SolanaAccount import error: {e}")
+            # Try to get signing capability
+            try:
+                # Check what's available for Solana
+                from cdp import solana_account
+                print(f"🔍 solana_account contents: {[x for x in dir(solana_account) if not x.startswith('_')]}")
+            except Exception as e:
+                print(f"solana_account import: {e}")
             
-            if self.solana_address:
-                self.initialized = True
-                print(f"✅ Solana account ready: {self.solana_address}")
-                return True
-            
-            print("❌ Could not determine Solana address")
-            return False
+            self.initialized = True
+            print(f"✅ Solana account ready: {self.solana_address}")
+            return True
             
         except Exception as e:
             print(f"❌ CDP init failed: {e}")
@@ -131,11 +110,11 @@ class DexTrader:
         return balances
     
     async def swap_usdc_to_token(self, token_address: str, amount_usdc: float, max_retries: int = 3) -> dict:
-        result = {"success": False, "tx_hash": "", "error": "Read-only mode - signing not available"}
+        result = {"success": False, "tx_hash": "", "error": "Signing not yet implemented for new SDK"}
         return result
     
     async def swap_token_to_usdc(self, token_address: str, max_retries: int = 3) -> dict:
-        result = {"success": False, "tx_hash": "", "error": "Read-only mode - signing not available"}
+        result = {"success": False, "tx_hash": "", "error": "Signing not yet implemented for new SDK"}
         return result
 
 dex_trader = DexTrader()
