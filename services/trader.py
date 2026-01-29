@@ -450,12 +450,12 @@ class Trader:
             
             if settings.live_trading and dex_trader.initialized:
                 # Validate trade safety
-            safety = await trade_safety.validate_trade(contract, position_usd, is_buy=True)
-            if not safety["should_proceed"]:
-                print(f"⛔ {coin}: Trade unsafe - {', '.join(safety['warnings'])}")
-                continue
-            
-            print(f"🔄 BUY ${position_usd:.2f} {coin}")
+                safety = await trade_safety.validate_trade(contract, position_usd, is_buy=True)
+                if not safety["should_proceed"]:
+                    print(f"⛔ {coin}: Trade unsafe - {', '.join(safety['warnings'])}")
+                    continue
+                
+                print(f"🔄 BUY ${position_usd:.2f} {coin}")
                 result = await dex_trader.swap_usdc_to_token(contract, position_usd)
                 
                 if not result["success"]:
