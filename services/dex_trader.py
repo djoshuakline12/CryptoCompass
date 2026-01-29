@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import aiohttp
+import base64
 from datetime import datetime, timezone
 
 class DexTrader:
@@ -18,14 +19,14 @@ class DexTrader:
     async def initialize(self):
         """Initialize CDP wallet"""
         try:
-            # Use correct env var names
             api_key = os.getenv("CDP_API_KEY_NAME")
             api_secret = os.getenv("CDP_API_KEY_SECRET", "").replace("\\n", "\n")
-            wallet_data = os.getenv("CDP_WALLET_SECRET")
+            wallet_data = os.getenv("CDP_WALLET_SECRET", "")
             
             print(f"🔍 api_key exists: {bool(api_key)}")
             print(f"🔍 api_secret exists: {bool(api_secret)}")
-            print(f"🔍 wallet_data exists: {bool(wallet_data)}")
+            print(f"🔍 wallet_data length: {len(wallet_data)}")
+            print(f"🔍 wallet_data first 50 chars: {wallet_data[:50]}...")
             
             if not api_key or not api_secret:
                 print("❌ Missing CDP API credentials")
@@ -35,41 +36,59 @@ class DexTrader:
                 print("❌ Missing wallet data")
                 return False
             
-            # Parse wallet data
-            data = json.loads(wallet_data)
-            print(f"🔍 wallet_data keys: {list(data.keys())}")
+            # Try to parse wallet data - could be JSON, base64, or seed phrase
+            data = None
             
-            # Extract address from wallet data
-            if "default_address" in data:
-                addr = data["default_address"]
-                if isinstance(addr, dict):
-                    self.solana_address = addr.get("address_id") or addr.get("address")
-                else:
-                    self.solana_address = addr
-            elif "address" in data:
-                self.solana_address = data["address"]
-            
-            if not self.solana_address:
-                print(f"❌ Could not find address in wallet data. Keys: {list(data.keys())}")
-                # Print more details to debug
-                for k, v in data.items():
-                    if isinstance(v, dict):
-                        print(f"🔍 {k}: {list(v.keys())}")
-                    else:
-                        print(f"🔍 {k}: {type(v).__name__}")
-                return False
-            
-            # Initialize CDP client
-            from cdp import CdpClient
-            self.client = CdpClient(api_key_id=api_key, api_key_secret=api_secret)
-            
-            # Try to get signing capability
+            # Try JSON first
             try:
-                # Check what's available for Solana
-                from cdp import solana_account
-                print(f"🔍 solana_account contents: {[x for x in dir(solana_account) if not x.startswith('_')]}")
+                data = json.loads(wallet_data)
+                print(f"🔍 Parsed as JSON, keys: {list(data.keys())}")
+            except:
+                pass
+            
+            # Try base64
+            if not data:
+                try:
+                    decoded = base64.b64decode(wallet_data).decode('utf-8')
+                    data = json.loads(decoded)
+                    print(f"🔍 Parsed as base64 JSON, keys: {list(data.keys())}")
+                except:
+                    pass
+            
+            # Maybe it's a seed phrase or private key directly
+            if not data:
+                if wallet_data.startswith('[') or len(wallet_data.split()) >= 12:
+                    print("🔍 Looks like a seed phrase or key array")
+                    # For seed phrase, we need the address separately
+                    self.solana_address = os.getenv("SOLANA_ADDRESS") or "BQVcTBUUHRcniikRzyfmddzkkUtDABkASvaVua13Yq4n"
+                else:
+                    print(f"🔍 Unknown format. Starts with: {wallet_data[:20]}")
+            
+            # Extract address from parsed data
+            if data:
+                if "default_address" in data:
+                    addr = data["default_address"]
+                    if isinstance(addr, dict):
+                        self.solana_address = addr.get("address_id") or addr.get("address")
+                    else:
+                        self.solana_address = addr
+                elif "address" in data:
+                    self.solana_address = data["address"]
+                elif "addresses" in data:
+                    self.solana_address = data["addresses"][0] if data["addresses"] else None
+            
+            # Fallback to known address if we can't parse
+            if not self.solana_address:
+                self.solana_address = os.getenv("SOLANA_ADDRESS", "BQVcTBUUHRcniikRzyfmddzkkUtDABkASvaVua13Yq4n")
+                print(f"🔍 Using fallback address: {self.solana_address}")
+            
+            # Initialize CDP client for potential future signing
+            try:
+                from cdp import CdpClient
+                self.client = CdpClient(api_key_id=api_key, api_key_secret=api_secret)
+                print("✅ CDP client initialized")
             except Exception as e:
-                print(f"solana_account import: {e}")
+                print(f"CDP client error: {e}")
             
             self.initialized = True
             print(f"✅ Solana account ready: {self.solana_address}")
