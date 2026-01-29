@@ -118,7 +118,7 @@ class DexTrader:
                             # Correct signature: send_transaction(network, transaction, idempotency_key)
                             idempotency_key = str(uuid.uuid4())
                             tx_result = self.solana_client.send_transaction(
-                                "solana-mainnet",
+                                "solana",
                                 tx_base64,
                                 idempotency_key
                             )
@@ -233,7 +233,7 @@ class DexTrader:
                         try:
                             idempotency_key = str(uuid.uuid4())
                             tx_result = self.solana_client.send_transaction(
-                                "solana-mainnet",
+                                "solana",
                                 tx_base64,
                                 idempotency_key
                             )
