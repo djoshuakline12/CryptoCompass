@@ -8,46 +8,48 @@ class Settings:
     def __init__(self):
         self.buzz_threshold = 200
         
-        # Exit targets
-        self.take_profit_percent = 8
+        # Exit targets (accounting for ~$0.50 gas)
+        self.take_profit_percent = 10   # Minimum to cover gas on small trades
         self.stop_loss_percent = 5
         
         self.live_trading = True
         self.trading_enabled = True
         
-        self.starting_portfolio_usd = 6
+        self.starting_portfolio_usd = 15
         self.realized_pnl = 0
-        self.max_open_positions = 3
+        self.max_open_positions = 2  # Fewer positions, larger size
         
         self.use_ai_sizing = True
         self.use_ai_smart_sell = True
-        self.min_position_usd = 1
-        self.max_position_usd = 3
         
-        # === TIER 1: SAFE TRADES (80% of portfolio) ===
+        # LARGER positions to make gas worthwhile
+        self.min_position_usd = 5     # Was $1 - too small
+        self.max_position_usd = 8     # Was $3 - too small
+        
+        # Strict filters
         self.min_market_cap = 500_000
         self.max_market_cap = 50_000_000
         self.min_liquidity = 100_000
         self.min_volume_24h = 50_000
         
-        # === TIER 2: DEGEN PLAYS - Pump.fun (20% of portfolio max) ===
+        # Degen plays
         self.degen_enabled = True
-        self.degen_max_portfolio_percent = 20  # Max 20% in degen plays
-        self.degen_max_position_usd = 1.5      # Smaller positions
-        self.degen_min_market_cap = 5_000      # $5k minimum (very early)
-        self.degen_max_market_cap = 100_000    # $100k max (still early)
-        self.degen_take_profit = 25            # Higher target (more volatile)
-        self.degen_stop_loss = 15              # Wider stop (more volatile)
+        self.degen_max_portfolio_percent = 20
+        self.degen_max_position_usd = 3
+        self.degen_min_market_cap = 5_000
+        self.degen_max_market_cap = 100_000
+        self.degen_take_profit = 25
+        self.degen_stop_loss = 15
         
         self.blacklisted_coins = set([
             "SOL", "ETH", "BTC", "USDC", "USDT", "HYPE", "BONK", "WIF",
             "JUP", "RAY", "ORCA", "PYTH", "JTO", "MOBILE", "RENDER"
         ])
         
-        self.cooldown_hours = 48
+        self.cooldown_hours = 24
         self.cooldown_coins = {}
-        self.max_daily_loss_usd = 2
-        self.max_daily_loss_percent = 30
+        self.max_daily_loss_usd = 3
+        self.max_daily_loss_percent = 20
         self.daily_pnl = 0
         self.daily_pnl_reset_date = datetime.now(timezone.utc).date()
         
@@ -56,7 +58,8 @@ class Settings:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
         
-        self.estimated_fee_percent = 1.0
+        # Gas estimate for P&L calculations
+        self.estimated_gas_per_trade = 0.50  # $0.50 round trip
         
         self.exchange_api_key = os.getenv("EXCHANGE_API_KEY", "")
         self.exchange_api_secret = os.getenv("EXCHANGE_API_SECRET", "")
@@ -69,7 +72,6 @@ class Settings:
         return self.starting_portfolio_usd + self.realized_pnl
     
     def get_degen_budget(self, current_portfolio: float, degen_positions_value: float) -> float:
-        """Calculate remaining budget for degen plays"""
         max_degen = current_portfolio * (self.degen_max_portfolio_percent / 100)
         remaining = max_degen - degen_positions_value
         return max(0, remaining)
