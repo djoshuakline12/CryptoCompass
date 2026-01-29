@@ -16,7 +16,6 @@ async def check_token_safety(contract_address: str) -> dict:
     
     try:
         async with aiohttp.ClientSession() as session:
-            # RugCheck.xyz API
             url = f"https://api.rugcheck.xyz/v1/tokens/{contract_address}/report"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
@@ -25,7 +24,6 @@ async def check_token_safety(contract_address: str) -> dict:
                     risks = data.get("risks", [])
                     risk_names = [r.get("name", "") for r in risks]
                     
-                    # Check for critical risks
                     critical_risks = [
                         "Honeypot",
                         "Mint Authority Enabled", 
@@ -43,7 +41,6 @@ async def check_token_safety(contract_address: str) -> dict:
                         result["reasons"] = found_critical
                         result["score"] = 20
                     
-                    # Check top holders
                     top_holders = data.get("topHolders", [])
                     if top_holders:
                         total_percent = sum(h.get("pct", 0) for h in top_holders[:10])
@@ -51,11 +48,6 @@ async def check_token_safety(contract_address: str) -> dict:
                         if total_percent > 50:
                             result["safe"] = False
                             result["reasons"].append(f"Top 10 holders own {total_percent:.0f}%")
-                    
-                    # Check if liquidity is locked
-                    if "liquidity" in str(data).lower() and "lock" in str(data).lower():
-                        result["liquidity_locked"] = True
-                        result["score"] += 10
                     
                     result["honeypot"] = "honeypot" in str(risks).lower()
                     
@@ -80,7 +72,7 @@ async def get_token_age_hours(contract_address: str) -> float:
                         if created:
                             import time
                             age_ms = time.time() * 1000 - created
-                            return age_ms / (1000 * 60 * 60)  # Convert to hours
+                            return age_ms / (1000 * 60 * 60)
     except:
         pass
     return 0
