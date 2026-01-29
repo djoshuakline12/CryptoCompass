@@ -34,8 +34,8 @@ class Trader:
         data = {
             "price": 0, "market_cap": 0, "liquidity": 0, "volume_24h": 0,
             "change_24h": 0, "change_1h": 0, "change_5m": 0,
-            "buys_1h": 0, "sells_1h": 0, "source": "unknown",
-            "contract_address": None, "chain": None
+            "buys_1h": 0, "sells_1h": 0, "buys_5m": 0, "sells_5m": 0,
+            "source": "unknown", "contract_address": None, "chain": None
         }
         
         try:
@@ -91,97 +91,74 @@ class Trader:
         target_chain = dex_trader.chain if dex_trader.initialized else "solana"
         contract = data.get("contract_address")
         
-        # Basic checks
         if data["price"] == 0:
             return False, "No price data"
         
         if data["chain"] != target_chain:
             return False, f"Wrong chain ({data['chain']})"
         
-        # Market cap filters
         if data["market_cap"] < settings.min_market_cap:
             return False, f"MC too low ${data['market_cap']:,.0f}"
         if data["market_cap"] > settings.max_market_cap:
             return False, f"MC too high ${data['market_cap']:,.0f}"
         
-        # Liquidity filter (CRITICAL)
         if data["liquidity"] < settings.min_liquidity:
             return False, f"Low liquidity ${data['liquidity']:,.0f}"
         
-        # Volume filter
         if data["volume_24h"] < settings.min_volume_24h:
             return False, f"Low volume ${data['volume_24h']:,.0f}"
         
-        # Volume/MC ratio (healthy = high volume relative to MC)
         vol_mc_ratio = data["volume_24h"] / data["market_cap"] if data["market_cap"] > 0 else 0
         if vol_mc_ratio < 0.1:
             return False, f"Low vol/MC ratio {vol_mc_ratio:.1%}"
         
-        # Activity filter
         activity = data["buys_1h"] + data["sells_1h"]
         if activity < 10:
             return False, f"Low activity ({activity} txns/hr)"
         
-        # Buy pressure (more buys than sells)
         buy_ratio = data["buys_1h"] / max(activity, 1)
         if buy_ratio < 0.45:
             return False, f"Weak buy pressure ({buy_ratio:.0%})"
         
-        # Momentum check (not dumping)
         if data["change_1h"] < -15:
             return False, f"Dumping {data['change_1h']:.0f}%"
         
-        # Not FOMO (not at local high)
         if data["change_5m"] > 20:
             return False, f"FOMO alert +{data['change_5m']:.0f}% in 5m"
         
-        # Token safety check (rug check)
         if contract:
             safety = await check_token_safety(contract)
             if not safety["safe"]:
                 reasons = ", ".join(safety["reasons"][:2])
-                return False, f"Safety fail: {reasons}"
+                return False, f"Safety: {reasons}"
             
-            # Token age (avoid brand new scams)
             age_hours = await get_token_age_hours(contract)
             if age_hours < 2:
-                return False, f"Too new ({age_hours:.1f}h old)"
-            if age_hours > 168:  # 7 days
-                return False, f"Too old ({age_hours/24:.0f} days)"
+                return False, f"Too new ({age_hours:.1f}h)"
+            if age_hours > 168:
+                return False, f"Too old ({age_hours/24:.0f}d)"
         
-        return True, "Passed all checks"
+        return True, "Passed"
     
     def calculate_position_size(self, available_usdc: float, risk_score: int) -> float:
-        """Dynamic position sizing with Kelly-inspired adjustments"""
-        
-        # Base: 20% of available
         base_percent = 0.20
         
-        # Adjust for win/loss streak
         if self.consecutive_wins >= 3:
-            base_percent = 0.30  # Increase after wins
+            base_percent = 0.30
         elif self.consecutive_losses >= 2:
-            base_percent = 0.10  # Decrease after losses
+            base_percent = 0.10
         
-        # Adjust by risk
         risk_mult = (100 - risk_score) / 100
         position_percent = base_percent * (0.5 + risk_mult * 0.5)
         
         position_usd = available_usdc * position_percent
-        
-        # Enforce limits
         position_usd = max(settings.min_position_usd, min(settings.max_position_usd, position_usd))
         
-        if position_usd < 0.50:
-            return 0
-        
-        return round(position_usd, 2)
+        return round(position_usd, 2) if position_usd >= 0.50 else 0
     
     def calculate_risk_score(self, signal: dict, data: dict) -> int:
-        """Risk score 0-100 (higher = riskier)"""
         risk = 50
         
-        # Liquidity
         if data["liquidity"] > 500000:
             risk -= 20
         elif data["liquidity"] > 200000:
@@ -189,14 +166,12 @@ class Trader:
         elif data["liquidity"] < 100000:
             risk += 15
         
-        # Volume/MC ratio
         vol_mc = data["volume_24h"] / data["market_cap"] if data["market_cap"] > 0 else 0
         if vol_mc > 0.5:
             risk -= 10
         elif vol_mc < 0.2:
             risk += 10
         
-        # Buy pressure
         activity = data["buys_1h"] + data["sells_1h"]
         buy_ratio = data["buys_1h"] / max(activity, 1)
         if buy_ratio > 0.6:
@@ -204,18 +179,15 @@ class Trader:
         elif buy_ratio < 0.4:
             risk += 15
         
-        # Volatility
         if abs(data["change_1h"]) > 30:
             risk += 15
         
         return max(10, min(90, risk))
     
     async def should_smart_sell(self, position: dict, current_price: float, pnl_percent: float) -> dict:
-        """Smart exit with partial profit taking"""
         coin = position["coin"]
         data = await self.get_token_data(coin)
         
-        # Track peak
         if coin not in self.position_highs:
             self.position_highs[coin] = pnl_percent
         else:
@@ -224,63 +196,55 @@ class Trader:
         peak = self.position_highs[coin]
         drawdown = peak - pnl_percent
         
-        # EMERGENCY: Liquidity crisis
         if data["liquidity"] < 20000:
-            return {"should_sell": True, "reason": "⚠️ Liquidity crisis", "sell_percent": 100}
+            return {"should_sell": True, "reason": "⚠️ Liquidity crisis"}
         
-        # HARD STOP
         if pnl_percent <= -settings.stop_loss_percent:
-            return {"should_sell": True, "reason": f"Stop loss {pnl_percent:.1f}%", "sell_percent": 100}
+            return {"should_sell": True, "reason": f"Stop loss {pnl_percent:.1f}%"}
         
-        # TIME STOP: Exit if flat after 2 hours
         open_time = position.get("open_time")
         if open_time:
             if isinstance(open_time, str):
                 open_time = datetime.fromisoformat(open_time.replace('Z', '+00:00'))
             hours_held = (datetime.now(timezone.utc) - open_time).total_seconds() / 3600
             if hours_held > 2 and -2 < pnl_percent < 3:
-                return {"should_sell": True, "reason": f"Time stop ({hours_held:.1f}h, flat)", "sell_percent": 100}
+                return {"should_sell": True, "reason": f"Time stop ({hours_held:.1f}h flat)"}
         
-        # TRAILING STOPS
         if peak >= 20 and drawdown > 8:
-            return {"should_sell": True, "reason": f"Trailing: was +{peak:.0f}%, now +{pnl_percent:.0f}%", "sell_percent": 100}
+            return {"should_sell": True, "reason": f"Trail: +{peak:.0f}%→+{pnl_percent:.0f}%"}
         if peak >= 10 and drawdown > 5:
-            return {"should_sell": True, "reason": f"Trailing: was +{peak:.0f}%, now +{pnl_percent:.0f}%", "sell_percent": 100}
+            return {"should_sell": True, "reason": f"Trail: +{peak:.0f}%→+{pnl_percent:.0f}%"}
         
-        # TAKE PROFIT at targets
         if pnl_percent >= settings.take_profit_percent:
-            return {"should_sell": True, "reason": f"Take profit +{pnl_percent:.1f}%", "sell_percent": 100}
+            return {"should_sell": True, "reason": f"Take profit +{pnl_percent:.1f}%"}
         
-        # MOMENTUM DEATH
         if data["change_5m"] < -10 and pnl_percent > 0:
-            return {"should_sell": True, "reason": "Momentum dying, locking profit", "sell_percent": 100}
+            return {"should_sell": True, "reason": "Momentum dying"}
         
-        # Heavy sell pressure
         activity = data.get("buys_5m", 0) + data.get("sells_5m", 0)
         if activity > 5:
             sell_ratio = data.get("sells_5m", 0) / activity
             if sell_ratio > 0.7 and pnl_percent > -3:
-                return {"should_sell": True, "reason": "Heavy selling pressure", "sell_percent": 100}
+                return {"should_sell": True, "reason": "Heavy sell pressure"}
         
-        return {"should_sell": False, "reason": "", "sell_percent": 0}
+        return {"should_sell": False, "reason": ""}
     
     async def process_signals(self, signals: list):
         if not settings.trading_enabled:
             return
         if settings.is_daily_loss_limit_hit():
-            print("⚠️ Daily loss limit hit - pausing")
+            print("⚠️ Daily loss limit - pausing")
             return
         
         positions = await self.db.get_open_positions()
         if len(positions) >= settings.max_open_positions:
             return
         
-        # Get actual USDC balance
         available_usdc = 0
         if dex_trader.initialized:
             balances = await dex_trader.get_balances()
             available_usdc = balances.get("usdc", 0)
-            print(f"💰 Available: ${available_usdc:.2f} USDC")
+            print(f"💰 ${available_usdc:.2f} USDC")
         
         if available_usdc < 0.50:
             return
@@ -297,7 +261,7 @@ class Trader:
             
             is_good, reason = await self.is_good_buy(coin, signal)
             if not is_good:
-                print(f"⛔ Skip {coin}: {reason}")
+                print(f"⛔ {coin}: {reason}")
                 continue
             
             data = await self.get_token_data(coin)
@@ -310,25 +274,23 @@ class Trader:
             if position_usd < 0.50:
                 continue
             
-            print(f"✅ {coin} passed! Risk:{risk_score} Liq:${data['liquidity']:,.0f} Vol:${data['volume_24h']:,.0f}")
+            print(f"✅ {coin} PASS Risk:{risk_score} Liq:${data['liquidity']:,.0f}")
             
             if settings.live_trading and dex_trader.initialized:
-                print(f"🔄 LIVE BUY: ${position_usd:.2f} of {coin}")
+                print(f"🔄 BUY ${position_usd:.2f} {coin}")
                 result = await dex_trader.swap_usdc_to_token(contract, position_usd)
                 
                 if not result["success"]:
-                    print(f"❌ Swap failed: {result['error']}")
+                    print(f"❌ Failed: {result['error']}")
                     continue
                 
                 print(f"✅ Bought!")
             else:
-                print(f"📝 PAPER BUY: {coin} @ ${price:.8f}")
-            
-            quantity = position_usd / price
+                print(f"📝 PAPER BUY: {coin}")
             
             await self.db.open_position({
                 "coin": coin,
-                "quantity": quantity,
+                "quantity": position_usd / price,
                 "buy_price": price,
                 "position_usd": position_usd,
                 "market_cap": data["market_cap"],
@@ -337,14 +299,11 @@ class Trader:
                 "chain": data["chain"],
                 "signal": signal
             })
-            
-            print(f"✅ Opened: {coin} ${position_usd:.2f}")
             break
         
         settings.record_successful_scan()
     
     async def get_live_price(self, coin: str) -> dict:
-        """Fresh price, no cache"""
         session = await self.get_session()
         target_chain = dex_trader.chain if dex_trader.initialized else "solana"
         
@@ -363,20 +322,16 @@ class Trader:
                             data["price"] = float(pair.get("priceUsd") or 0)
                             data["liquidity"] = float(pair.get("liquidity", {}).get("usd") or 0)
                             data["change_5m"] = float(pair.get("priceChange", {}).get("m5") or 0)
-                            data["change_1h"] = float(pair.get("priceChange", {}).get("h1") or 0)
                             txns = pair.get("txns", {})
                             data["buys_5m"] = txns.get("m5", {}).get("buys", 0)
                             data["sells_5m"] = txns.get("m5", {}).get("sells", 0)
                             break
         except:
             pass
-        
         return data
     
     async def check_exit_conditions_live(self):
-        """Monitor positions with live prices"""
         positions = await self.db.get_open_positions()
-        
         if not positions:
             return
         
@@ -393,7 +348,6 @@ class Trader:
             
             pnl_percent = ((current_price - buy_price) / buy_price) * 100
             
-            # Update cache
             self.token_data_cache[coin.upper()] = {
                 "data": {**data, "contract_address": contract, "chain": dex_trader.chain},
                 "timestamp": datetime.now(timezone.utc)
@@ -403,7 +357,7 @@ class Trader:
             
             if decision["should_sell"]:
                 if settings.live_trading and dex_trader.initialized and contract:
-                    print(f"🔄 SELL: {coin} @ {pnl_percent:+.1f}% - {decision['reason']}")
+                    print(f"🔄 SELL {coin} {pnl_percent:+.1f}% - {decision['reason']}")
                     result = await dex_trader.swap_token_to_usdc(contract)
                     
                     if not result["success"]:
@@ -412,7 +366,6 @@ class Trader:
                     
                     print(f"✅ Sold!")
                     
-                    # Update win/loss streak
                     if pnl_percent > 0:
                         self.consecutive_wins += 1
                         self.consecutive_losses = 0
@@ -420,7 +373,7 @@ class Trader:
                         self.consecutive_losses += 1
                         self.consecutive_wins = 0
                 else:
-                    print(f"📝 PAPER SELL: {coin} @ {pnl_percent:+.1f}%")
+                    print(f"📝 PAPER SELL: {coin} {pnl_percent:+.1f}%")
                 
                 if coin in self.position_highs:
                     del self.position_highs[coin]
