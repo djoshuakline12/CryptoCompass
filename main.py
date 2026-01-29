@@ -270,3 +270,23 @@ async def get_ai_insights(user=Depends(verify_token)):
             })
     
     return insights
+
+# Backtest endpoint
+from services.backtester import backtester
+
+@app.get("/backtest")
+async def run_backtest(user=Depends(verify_token)):
+    """Run backtest on recent trending tokens"""
+    # Get some tokens to test
+    from services.signal_sources import signal_sources
+    signals = await signal_sources.get_all_signals()
+    tokens = [s.get("contract_address") for s in signals if s.get("contract_address")][:10]
+    
+    result = await backtester.run_backtest(tokens)
+    return result
+
+@app.get("/market/status")
+async def get_market_status(user=Depends(verify_token)):
+    """Get current market conditions"""
+    from services.market_correlation import market_correlation
+    return await market_correlation.check_market_conditions()
