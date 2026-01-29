@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     # Start both loops
     asyncio.create_task(signal_scan_loop())
     asyncio.create_task(position_monitor_loop())
-    print("🚀 Trading loops started')
+    print("🚀 Trading loops started")
     
     # Sync wallet on startup
     from services.wallet_sync import wallet_sync
