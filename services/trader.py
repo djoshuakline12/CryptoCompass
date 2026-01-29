@@ -14,6 +14,7 @@ from services.pumpfun_scanner import pumpfun_scanner
 from services.dev_tracker import dev_tracker
 from services.tx_simulator import tx_simulator
 from services.trade_safety import trade_safety
+from services.portfolio_monitor import portfolio_monitor
 
 class Trader:
     def __init__(self, db: Database):
@@ -386,6 +387,16 @@ class Trader:
             balances = await dex_trader.get_balances()
             available_usdc = balances.get("usdc", 0)
             print(f"💰 ${available_usdc:.2f} | BTC:{market['btc_change_24h']:+.1f}% SOL:{market['sol_change_1h']:+.1f}%")
+        
+        # Check portfolio health
+        balances = await dex_trader.get_balances()
+        positions_value = sum(pos.get("buy_price", 0) * pos.get("quantity", 0) for pos in positions)
+        health = await portfolio_monitor.check_health(balances.get("sol", 0), available_usdc, positions_value)
+        
+        if health["should_pause_trading"]:
+            for warning in health["warnings"]:
+                print(warning)
+            return
         
         if available_usdc < 0.50:
             return

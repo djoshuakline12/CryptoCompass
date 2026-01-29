@@ -406,3 +406,37 @@ async def get_wallet_holdings(user=Depends(verify_token)):
         "total_value": total_value,
         "token_count": len(holdings)
     }
+
+# Portfolio monitoring
+from services.portfolio_monitor import portfolio_monitor
+
+@app.get("/portfolio/health")
+async def get_portfolio_health(user=Depends(verify_token)):
+    """Check portfolio health status"""
+    if not dex_trader.initialized:
+        return {"error": "DEX not initialized"}
+    
+    balances = await dex_trader.get_balances()
+    positions = await db.get_open_positions()
+    
+    # Calculate positions value
+    positions_value = 0
+    for pos in positions:
+        from services.trader import Trader
+        trader = Trader(db)
+        price = await trader.get_current_price(pos["coin"])
+        positions_value += price * pos.get("quantity", 0)
+    
+    health = await portfolio_monitor.check_health(
+        balances.get("sol", 0),
+        balances.get("usdc", 0),
+        positions_value
+    )
+    
+    return health
+
+@app.get("/portfolio/performance")
+async def get_performance(user=Depends(verify_token)):
+    """Get trading performance summary"""
+    history = await db.get_trade_history()
+    return portfolio_monitor.get_performance_summary(history)
