@@ -290,3 +290,113 @@ async def get_market_status(user=Depends(verify_token)):
     """Get current market conditions"""
     from services.market_correlation import market_correlation
     return await market_correlation.check_market_conditions()
+
+# Wallet sync endpoints
+from services.wallet_sync import wallet_sync
+
+@app.get("/wallet/sync")
+async def sync_wallet(user=Depends(verify_token)):
+    """Sync wallet holdings with database"""
+    if not dex_trader.initialized:
+        return {"error": "DEX not initialized"}
+    
+    results = await wallet_sync.sync_positions(dex_trader.solana_address, db)
+    return results
+
+@app.post("/wallet/sell-orphans")
+async def sell_orphans(user=Depends(verify_token)):
+    """Attempt to sell all orphan tokens"""
+    if not dex_trader.initialized:
+        return {"error": "DEX not initialized"}
+    
+    # Get wallet tokens
+    tokens = await wallet_sync.get_wallet_tokens(dex_trader.solana_address)
+    
+    results = {
+        "attempted": 0,
+        "sold": [],
+        "failed": [],
+        "total_recovered": 0
+    }
+    
+    for token in tokens:
+        contract = token["contract_address"]
+        symbol = token["symbol"]
+        amount = token["amount"]
+        
+        # Get value info
+        value_info = await wallet_sync.get_token_value(contract)
+        
+        if value_info["price"] <= 0:
+            results["failed"].append({"symbol": symbol, "reason": "No price data"})
+            continue
+        
+        if value_info["liquidity"] < 1000:
+            results["failed"].append({"symbol": symbol, "reason": f"Low liquidity ${value_info['liquidity']:.0f}"})
+            continue
+        
+        value_usd = amount * value_info["price"]
+        
+        if value_usd < 0.10:
+            results["failed"].append({"symbol": symbol, "reason": f"Dust ${value_usd:.4f}"})
+            continue
+        
+        results["attempted"] += 1
+        print(f"🔄 Selling orphan: {symbol} (${value_usd:.2f})")
+        
+        # Try to sell
+        result = await dex_trader.swap_token_to_usdc(contract)
+        
+        if result["success"]:
+            results["sold"].append({
+                "symbol": symbol,
+                "value_usd": value_usd,
+                "tx": result.get("tx_hash", "")
+            })
+            results["total_recovered"] += value_usd
+            print(f"✅ Sold {symbol} for ~${value_usd:.2f}")
+            
+            # Close position if exists
+            await db.close_position(symbol, value_info["price"], "Orphan cleanup")
+        else:
+            results["failed"].append({
+                "symbol": symbol,
+                "reason": result.get("error", "Unknown error")
+            })
+            print(f"❌ Failed to sell {symbol}: {result.get('error')}")
+    
+    return results
+
+@app.get("/wallet/holdings")
+async def get_wallet_holdings(user=Depends(verify_token)):
+    """Get all current wallet holdings with values"""
+    if not dex_trader.initialized:
+        return {"error": "DEX not initialized"}
+    
+    tokens = await wallet_sync.get_wallet_tokens(dex_trader.solana_address)
+    
+    holdings = []
+    total_value = 0
+    
+    for token in tokens:
+        value_info = await wallet_sync.get_token_value(token["contract_address"])
+        value_usd = token["amount"] * value_info["price"] if value_info["price"] > 0 else 0
+        
+        holdings.append({
+            "symbol": value_info["symbol"] or token["symbol"],
+            "contract": token["contract_address"],
+            "amount": token["amount"],
+            "price": value_info["price"],
+            "value_usd": value_usd,
+            "liquidity": value_info["liquidity"]
+        })
+        total_value += value_usd
+    
+    # Sort by value
+    holdings.sort(key=lambda x: x["value_usd"], reverse=True)
+    
+    return {
+        "holdings": holdings,
+        "total_value": total_value,
+        "token_count": len(holdings)
+    }
