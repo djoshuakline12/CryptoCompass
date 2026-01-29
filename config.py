@@ -8,7 +8,7 @@ class Settings:
     def __init__(self):
         self.buzz_threshold = 200
         
-        # Tighter profit/loss - account for fees
+        # Exit targets
         self.take_profit_percent = 8
         self.stop_loss_percent = 5
         
@@ -17,18 +17,27 @@ class Settings:
         
         self.starting_portfolio_usd = 6
         self.realized_pnl = 0
-        self.max_open_positions = 2
+        self.max_open_positions = 3
         
         self.use_ai_sizing = True
         self.use_ai_smart_sell = True
         self.min_position_usd = 1
         self.max_position_usd = 3
         
-        # Strict filters
+        # === TIER 1: SAFE TRADES (80% of portfolio) ===
         self.min_market_cap = 500_000
         self.max_market_cap = 50_000_000
         self.min_liquidity = 100_000
         self.min_volume_24h = 50_000
+        
+        # === TIER 2: DEGEN PLAYS - Pump.fun (20% of portfolio max) ===
+        self.degen_enabled = True
+        self.degen_max_portfolio_percent = 20  # Max 20% in degen plays
+        self.degen_max_position_usd = 1.5      # Smaller positions
+        self.degen_min_market_cap = 5_000      # $5k minimum (very early)
+        self.degen_max_market_cap = 100_000    # $100k max (still early)
+        self.degen_take_profit = 25            # Higher target (more volatile)
+        self.degen_stop_loss = 15              # Wider stop (more volatile)
         
         self.blacklisted_coins = set([
             "SOL", "ETH", "BTC", "USDC", "USDT", "HYPE", "BONK", "WIF",
@@ -58,6 +67,12 @@ class Settings:
     @property
     def total_portfolio_usd(self) -> float:
         return self.starting_portfolio_usd + self.realized_pnl
+    
+    def get_degen_budget(self, current_portfolio: float, degen_positions_value: float) -> float:
+        """Calculate remaining budget for degen plays"""
+        max_degen = current_portfolio * (self.degen_max_portfolio_percent / 100)
+        remaining = max_degen - degen_positions_value
+        return max(0, remaining)
     
     def add_realized_pnl(self, pnl: float):
         self.realized_pnl += pnl
