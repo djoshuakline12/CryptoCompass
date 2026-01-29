@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import aiohttp
+import uuid
 from datetime import datetime, timezone
 
 class DexTrader:
@@ -29,14 +30,6 @@ class DexTrader:
             
             self.client = CdpClient(api_key_id=api_key, api_key_secret=api_secret)
             self.solana_client = SolanaClient(self.client.api_clients)
-            
-            # Debug: check send_transaction signature
-            import inspect
-            try:
-                sig = inspect.signature(self.solana_client.send_transaction)
-                print(f"🔍 send_transaction params: {list(sig.parameters.keys())}")
-            except Exception as e:
-                print(f"🔍 Could not inspect: {e}")
             
             self.initialized = True
             print(f"✅ Solana ready: {self.solana_address}")
@@ -119,56 +112,44 @@ class DexTrader:
                             result["error"] = "No transaction"
                             continue
                         
-                        print(f"🔍 Sending via CDP...")
+                        print(f"🔍 Sending via CDP (network=solana-mainnet)...")
                         
                         try:
-                            # Try different method signatures
-                            tx_result = None
-                            
-                            # Try 1: Just transaction
-                            try:
-                                tx_result = self.solana_client.send_transaction(tx_base64)
-                            except TypeError:
-                                pass
-                            
-                            # Try 2: transaction as keyword
-                            if tx_result is None:
-                                try:
-                                    tx_result = self.solana_client.send_transaction(transaction=tx_base64)
-                                except TypeError:
-                                    pass
-                            
-                            # Try 3: With address as positional
-                            if tx_result is None:
-                                try:
-                                    tx_result = self.solana_client.send_transaction(self.solana_address, tx_base64)
-                                except TypeError:
-                                    pass
-                            
-                            if tx_result is None:
-                                result["error"] = "Could not call send_transaction"
-                                continue
+                            # Correct signature: send_transaction(network, transaction, idempotency_key)
+                            idempotency_key = str(uuid.uuid4())
+                            tx_result = self.solana_client.send_transaction(
+                                "solana-mainnet",
+                                tx_base64,
+                                idempotency_key
+                            )
                             
                             if asyncio.iscoroutine(tx_result):
                                 tx_result = await tx_result
                             
+                            print(f"🔍 TX result type: {type(tx_result)}")
                             print(f"🔍 TX result: {tx_result}")
                             
                             result["success"] = True
                             if hasattr(tx_result, 'signature'):
                                 result["tx_hash"] = tx_result.signature
+                            elif hasattr(tx_result, 'transaction_hash'):
+                                result["tx_hash"] = tx_result.transaction_hash
                             elif isinstance(tx_result, dict):
-                                result["tx_hash"] = tx_result.get("signature", str(tx_result))
+                                result["tx_hash"] = tx_result.get("signature", tx_result.get("hash", str(tx_result)))
                             else:
                                 result["tx_hash"] = str(tx_result)
                             
                             self.last_trade_time = datetime.now(timezone.utc)
-                            print(f"✅ TX sent: {result['tx_hash'][:30]}...")
+                            print(f"✅ TX sent: {result['tx_hash']}")
                             return result
                             
                         except Exception as e:
-                            print(f"❌ CDP error: {e}")
-                            result["error"] = str(e)[:100]
+                            error_str = str(e)
+                            print(f"❌ CDP error: {error_str}")
+                            result["error"] = error_str[:100]
+                            if "blockhash" in error_str.lower():
+                                await asyncio.sleep(1)
+                                continue
                         
                 except asyncio.TimeoutError:
                     result["error"] = f"Timeout {attempt + 1}"
@@ -250,14 +231,12 @@ class DexTrader:
                             continue
                         
                         try:
-                            tx_result = None
-                            try:
-                                tx_result = self.solana_client.send_transaction(tx_base64)
-                            except TypeError:
-                                try:
-                                    tx_result = self.solana_client.send_transaction(transaction=tx_base64)
-                                except TypeError:
-                                    tx_result = self.solana_client.send_transaction(self.solana_address, tx_base64)
+                            idempotency_key = str(uuid.uuid4())
+                            tx_result = self.solana_client.send_transaction(
+                                "solana-mainnet",
+                                tx_base64,
+                                idempotency_key
+                            )
                             
                             if asyncio.iscoroutine(tx_result):
                                 tx_result = await tx_result
