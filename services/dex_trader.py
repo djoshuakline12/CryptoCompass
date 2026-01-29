@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 class DexTrader:
     def __init__(self):
         self.initialized = False
-        self.wallet = None
+        self.client = None
+        self.solana_account = None
         self.solana_address = None
         self.chain = "solana"
         self.last_trade_time = None
@@ -15,62 +16,66 @@ class DexTrader:
         self.pending_trades = set()
     
     async def initialize(self):
-        """Initialize CDP wallet"""
+        """Initialize CDP wallet with new SDK"""
         try:
-            # Try different import patterns for CDP SDK
-            try:
-                from cdp import Cdp, Wallet
-            except ImportError:
-                try:
-                    from cdp.client import Cdp
-                    from cdp.wallet import Wallet
-                except ImportError:
-                    try:
-                        from coinbase_sdk import Cdp, Wallet
-                    except ImportError:
-                        # Try to see what's available
-                        import cdp
-                        print(f"CDP module contents: {dir(cdp)}")
-                        
-                        # Try common patterns
-                        if hasattr(cdp, 'CDP'):
-                            Cdp = cdp.CDP
-                        elif hasattr(cdp, 'Client'):
-                            Cdp = cdp.Client
-                        else:
-                            raise ImportError(f"Cannot find Cdp class. Available: {dir(cdp)}")
-                        
-                        if hasattr(cdp, 'Wallet'):
-                            Wallet = cdp.Wallet
-                        else:
-                            raise ImportError(f"Cannot find Wallet class. Available: {dir(cdp)}")
+            from cdp import CdpClient
+            from cdp.solana_account import SolanaAccount
             
             api_key = os.getenv("CDP_API_KEY_NAME")
             api_secret = os.getenv("CDP_API_KEY_PRIVATE_KEY", "").replace("\\n", "\n")
             wallet_data = os.getenv("CDP_WALLET_DATA")
             
-            if not all([api_key, api_secret, wallet_data]):
+            if not all([api_key, api_secret]):
                 print("❌ Missing CDP credentials")
                 return False
             
-            Cdp.configure(api_key, api_secret)
+            # Initialize client
+            self.client = CdpClient(api_key_id=api_key, api_key_secret=api_secret)
             
-            data = json.loads(wallet_data)
-            self.wallet = Wallet.import_data(data)
-            self.solana_address = self.wallet.default_address.address_id
-            self.initialized = True
-            print(f"✅ Solana account ready: {self.solana_address}")
-            return True
+            # Try to import existing wallet or use address directly
+            if wallet_data:
+                try:
+                    data = json.loads(wallet_data)
+                    # New SDK might have different import method
+                    if "address" in data:
+                        self.solana_address = data["address"]
+                    elif "default_address" in data:
+                        self.solana_address = data["default_address"]
+                    elif "addresses" in data and len(data["addresses"]) > 0:
+                        self.solana_address = data["addresses"][0]
+                    
+                    # Try to import the account
+                    if "private_key" in data or "seed" in data:
+                        # Import from private key/seed
+                        self.solana_account = SolanaAccount.import_account(data)
+                        self.solana_address = self.solana_account.address
+                except Exception as e:
+                    print(f"Wallet import error: {e}")
+            
+            # If we have an address from env, use it directly
+            if not self.solana_address:
+                # Check if address is stored separately
+                self.solana_address = os.getenv("SOLANA_WALLET_ADDRESS", "")
+            
+            if self.solana_address:
+                self.initialized = True
+                print(f"✅ Solana account ready: {self.solana_address}")
+                return True
+            else:
+                print("❌ No Solana address found")
+                return False
             
         except Exception as e:
             print(f"❌ CDP init failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     async def get_balances(self) -> dict:
         """Get current wallet balances"""
         balances = {"sol": 0, "usdc": 0}
         
-        if not self.initialized:
+        if not self.solana_address:
             return balances
         
         try:
@@ -83,11 +88,8 @@ class DexTrader:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        
-                        # Native SOL
                         balances["sol"] = data.get("nativeBalance", 0) / 1e9
                         
-                        # Find USDC
                         for token in data.get("tokens", []):
                             if token.get("mint") == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":
                                 balances["usdc"] = float(token.get("amount", 0)) / 1e6
@@ -98,11 +100,11 @@ class DexTrader:
         return balances
     
     async def swap_usdc_to_token(self, token_address: str, amount_usdc: float, max_retries: int = 3) -> dict:
-        """Swap USDC to token with retry logic"""
+        """Swap USDC to token"""
         result = {"success": False, "tx_hash": "", "error": ""}
         
-        if not self.initialized:
-            result["error"] = "DEX not initialized"
+        if not self.initialized or not self.solana_account:
+            result["error"] = "DEX not initialized or no signing capability"
             return result
         
         trade_key = f"buy_{token_address}"
@@ -153,7 +155,13 @@ class DexTrader:
                             continue
                         
                         tx_base64 = swap_data["swapTransaction"]
-                        signed = self.wallet.default_address.sign_transaction(tx_base64)
+                        
+                        # Sign with new SDK
+                        try:
+                            signed = self.solana_account.sign_transaction(tx_base64)
+                        except AttributeError:
+                            # Try alternate method
+                            signed = await self.solana_account.sign(tx_base64)
                         
                         send_body = {
                             "jsonrpc": "2.0",
@@ -194,8 +202,8 @@ class DexTrader:
         """Swap ALL of a token to USDC"""
         result = {"success": False, "tx_hash": "", "error": ""}
         
-        if not self.initialized:
-            result["error"] = "DEX not initialized"
+        if not self.initialized or not self.solana_account:
+            result["error"] = "DEX not initialized or no signing capability"
             return result
         
         trade_key = f"sell_{token_address}"
@@ -261,7 +269,11 @@ class DexTrader:
                             continue
                         
                         tx_base64 = swap_data["swapTransaction"]
-                        signed = self.wallet.default_address.sign_transaction(tx_base64)
+                        
+                        try:
+                            signed = self.solana_account.sign_transaction(tx_base64)
+                        except AttributeError:
+                            signed = await self.solana_account.sign(tx_base64)
                         
                         send_body = {
                             "jsonrpc": "2.0",
