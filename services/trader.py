@@ -19,7 +19,7 @@ class Trader:
         self.db = db
         self.session = None
         self.token_data_cache = {}
-        self.position_highs = {}
+        self.position_highs = {}  # Track peak P&L for each coin
         self.consecutive_wins = 0
         self.consecutive_losses = 0
     
@@ -278,11 +278,11 @@ class Trader:
     
     async def should_smart_sell(self, position: dict, current_price: float, pnl_percent: float) -> dict:
         """
-        IMPROVED EXIT STRATEGY:
-        - Quick profit at +5% 
-        - Trailing stop from +3% (protect small gains)
-        - Momentum-based exits
-        - Tight stop loss at -4%
+        RIDE THE WAVE STRATEGY:
+        - Let winners run indefinitely
+        - Once up 3%+, trail with 1% buffer
+        - Sell the moment it dips from peak
+        - Hard stop at -4%
         """
         coin = position["coin"]
         data = await self.get_token_data(coin)
@@ -295,66 +295,61 @@ class Trader:
             self.position_highs[coin] = max(self.position_highs[coin], pnl_percent)
         
         peak = self.position_highs[coin]
-        drawdown = peak - pnl_percent
+        drop_from_peak = peak - pnl_percent
         
         # === EMERGENCY EXITS ===
         if data["liquidity"] < 10000:
             return {"should_sell": True, "reason": "⚠️ Liquidity crisis"}
         
-        # Dev selling - immediate exit
         contract = position.get("contract_address")
         if contract and dev_tracker.is_known_dev_seller(contract):
             return {"should_sell": True, "reason": "🚨 Dev selling!"}
         
-        # === STOP LOSS ===
-        stop_loss = -15 if is_degen else -4  # Tighter stop for safe trades
+        # === HARD STOP LOSS ===
+        stop_loss = -12 if is_degen else -4
         if pnl_percent <= stop_loss:
             return {"should_sell": True, "reason": f"Stop loss {pnl_percent:.1f}%"}
         
-        # === TAKE PROFIT ===
-        take_profit = 20 if is_degen else 5  # Quick profit for safe trades
-        if pnl_percent >= take_profit:
-            return {"should_sell": True, "reason": f"🎯 Take profit +{pnl_percent:.1f}%"}
+        # === RIDE THE WAVE - Tight Trailing Stop ===
+        # Once we're up 3%, activate tight trailing
+        # Sell if we drop more than 1% from peak
         
-        # === TRAILING STOPS (protect gains) ===
-        # Once we're up 3%, don't let it go red
-        if peak >= 3 and pnl_percent <= 0.5:
-            return {"should_sell": True, "reason": f"Protect gains: was +{peak:.1f}%"}
+        if peak >= 3:
+            # The higher we go, the tighter the trail
+            if peak >= 20:
+                trail_buffer = 2.0  # At +20%, allow 2% drop (sell at +18%)
+            elif peak >= 10:
+                trail_buffer = 1.5  # At +10%, allow 1.5% drop (sell at +8.5%)
+            elif peak >= 5:
+                trail_buffer = 1.0  # At +5%, allow 1% drop (sell at +4%)
+            else:
+                trail_buffer = 1.0  # At +3%, allow 1% drop (sell at +2%)
+            
+            if drop_from_peak >= trail_buffer:
+                return {
+                    "should_sell": True, 
+                    "reason": f"🏄 Rode to +{peak:.1f}%, selling at +{pnl_percent:.1f}%"
+                }
         
-        # Once up 5%, keep at least 2%
-        if peak >= 5 and pnl_percent <= 2:
-            return {"should_sell": True, "reason": f"Trail: +{peak:.1f}%→+{pnl_percent:.1f}%"}
-        
-        # Once up 10%, keep at least 5%
-        if peak >= 10 and pnl_percent <= 5:
-            return {"should_sell": True, "reason": f"Trail: +{peak:.1f}%→+{pnl_percent:.1f}%"}
-        
-        # Once up 20%, keep at least 12%
-        if peak >= 20 and pnl_percent <= 12:
-            return {"should_sell": True, "reason": f"Trail: +{peak:.1f}%→+{pnl_percent:.1f}%"}
-        
-        # === TIME STOP ===
+        # === TIME-BASED EXITS ===
         open_time = position.get("open_time")
         if open_time:
             if isinstance(open_time, str):
                 open_time = datetime.fromisoformat(open_time.replace('Z', '+00:00'))
             hours_held = (datetime.now(timezone.utc) - open_time).total_seconds() / 3600
             
-            # Exit flat positions after 30 min
-            if hours_held > 0.5 and -1 < pnl_percent < 2:
-                return {"should_sell": True, "reason": f"Time stop ({hours_held*60:.0f}m, flat)"}
+            # If flat after 45 min, cut it
+            if hours_held > 0.75 and -1 < pnl_percent < 2:
+                return {"should_sell": True, "reason": f"Time stop ({hours_held*60:.0f}m flat)"}
+            
+            # If losing after 30 min, cut it faster
+            if hours_held > 0.5 and pnl_percent < -2:
+                return {"should_sell": True, "reason": f"Cutting loser ({hours_held*60:.0f}m)"}
         
-        # === MOMENTUM EXITS ===
-        # Price tanking in last 5 min while we're still positive - get out
-        if data["change_5m"] < -5 and pnl_percent > 0:
-            return {"should_sell": True, "reason": f"Momentum dying (-{abs(data['change_5m']):.0f}%/5m)"}
-        
-        # Heavy sell pressure
-        activity = data.get("buys_5m", 0) + data.get("sells_5m", 0)
-        if activity > 10:
-            sell_ratio = data.get("sells_5m", 0) / activity
-            if sell_ratio > 0.65 and pnl_percent > -2:
-                return {"should_sell": True, "reason": f"Sell pressure ({sell_ratio:.0%} sells)"}
+        # === MOMENTUM DEATH ===
+        # Rapid price drop while we're still slightly positive
+        if data["change_5m"] < -8 and pnl_percent > -1:
+            return {"should_sell": True, "reason": f"Momentum crash {data['change_5m']:.0f}%/5m"}
         
         return {"should_sell": False, "reason": ""}
     
