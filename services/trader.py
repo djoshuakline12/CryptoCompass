@@ -10,6 +10,9 @@ from services.volume_detector import volume_detector
 from services.market_correlation import market_correlation
 from services.alerts import alert_service
 from services.signal_sources import signal_sources
+from services.pumpfun_scanner import pumpfun_scanner
+from services.dev_tracker import dev_tracker
+from services.tx_simulator import tx_simulator
 
 class Trader:
     def __init__(self, db: Database):
@@ -90,127 +93,169 @@ class Trader:
         data = await self.get_token_data(coin)
         return data["price"]
     
-    async def calculate_signal_score(self, coin: str, contract: str, data: dict) -> dict:
-        """Calculate comprehensive signal score using all factors"""
-        
-        scores = {
-            "base": 0,
-            "whale": 0,
-            "volume_spike": 0,
-            "momentum": 0,
-            "safety": 0,
-            "total": 0,
-            "reasons": []
-        }
-        
-        # 1. Whale activity (0-25 points)
-        whale_data = whale_tracker.get_whale_score(contract)
-        if whale_data["whale_count"] > 0:
-            scores["whale"] = min(whale_data["whale_count"] * 10, 25)
-            if whale_data["recent"]:
-                scores["whale"] += 10
-                scores["reasons"].append(f"🐋 {whale_data['whale_count']} whales buying")
-        
-        # 2. Volume spike (0-25 points)
-        if contract:
-            vol_data = await volume_detector.check_volume_spike(contract)
-            if vol_data["has_spike"]:
-                scores["volume_spike"] = min(int(vol_data["spike_multiplier"] * 5), 25)
-                scores["reasons"].append(f"📈 {vol_data['spike_multiplier']:.1f}x volume spike")
-        
-        # 3. Momentum (0-25 points)
-        if 5 < data["change_1h"] < 30:
-            scores["momentum"] = 15
-            scores["reasons"].append(f"🚀 +{data['change_1h']:.0f}% 1h")
-        if data["change_5m"] > 3:
-            scores["momentum"] += 10
-        
-        # 4. Buy pressure (0-15 points)
-        activity = data["buys_1h"] + data["sells_1h"]
-        if activity > 0:
-            buy_ratio = data["buys_1h"] / activity
-            if buy_ratio > 0.6:
-                scores["base"] += 15
-                scores["reasons"].append(f"💪 {buy_ratio:.0%} buy pressure")
-        
-        # 5. Vol/MC ratio (0-10 points)
-        if data["market_cap"] > 0:
-            vol_mc = data["volume_24h"] / data["market_cap"]
-            if vol_mc > 0.5:
-                scores["base"] += 10
-                scores["reasons"].append("🔥 High volume/MC")
-        
-        scores["total"] = sum([
-            scores["base"],
-            scores["whale"],
-            scores["volume_spike"],
-            scores["momentum"]
-        ])
-        
-        return scores
+    def is_degen_signal(self, signal: dict) -> bool:
+        """Check if signal is from pump.fun (degen tier)"""
+        source = signal.get("source", "")
+        return source in ["pumpfun_new", "pumpfun_graduating"]
     
-    async def is_good_buy(self, coin: str, signal: dict) -> tuple:
-        data = await self.get_token_data(coin)
-        target_chain = dex_trader.chain if dex_trader.initialized else "solana"
-        contract = data.get("contract_address") or signal.get("contract_address")
+    async def is_good_buy_safe(self, coin: str, signal: dict, data: dict, contract: str) -> tuple:
+        """Tier 1: Safe trade validation (strict filters)"""
         
-        if data["price"] == 0:
-            return False, "No price data", 0
-        
-        if data["chain"] != target_chain:
-            return False, f"Wrong chain ({data['chain']})", 0
-        
-        # Market correlation check
-        market = await market_correlation.check_market_conditions()
-        if not market["safe_to_buy"]:
-            return False, market["warning"], 0
-        
-        # Basic filters
         if data["market_cap"] < settings.min_market_cap:
-            return False, f"MC ${data['market_cap']:,.0f}", 0
+            return False, f"MC ${data['market_cap']:,.0f}"
         if data["market_cap"] > settings.max_market_cap:
-            return False, f"MC too high ${data['market_cap']:,.0f}", 0
+            return False, f"MC too high ${data['market_cap']:,.0f}"
         if data["liquidity"] < settings.min_liquidity:
-            return False, f"Liq ${data['liquidity']:,.0f}", 0
+            return False, f"Liq ${data['liquidity']:,.0f}"
         if data["volume_24h"] < settings.min_volume_24h:
-            return False, f"Vol ${data['volume_24h']:,.0f}", 0
+            return False, f"Vol ${data['volume_24h']:,.0f}"
         
         # Activity filter
         activity = data["buys_1h"] + data["sells_1h"]
         if activity < 10:
-            return False, f"Low activity ({activity}/hr)", 0
-        
-        # Not dumping
-        if data["change_1h"] < -15:
-            return False, f"Dumping {data['change_1h']:.0f}%", 0
-        
-        # Not FOMO
-        if data["change_5m"] > 25:
-            return False, f"FOMO +{data['change_5m']:.0f}%/5m", 0
+            return False, f"Low activity ({activity}/hr)"
         
         # Safety check
         if contract:
             safety = await check_token_safety(contract)
             if not safety["safe"]:
                 reasons = ", ".join(safety["reasons"][:2])
-                return False, f"Safety: {reasons}", 0
+                return False, f"Safety: {reasons}"
             
             age_hours = await get_token_age_hours(contract)
             if age_hours < 1:
-                return False, f"Too new ({age_hours:.1f}h)", 0
+                return False, f"Too new ({age_hours:.1f}h)"
             if age_hours > 168:
-                return False, f"Too old ({age_hours/24:.0f}d)", 0
+                return False, f"Too old ({age_hours/24:.0f}d)"
+            
+            # Honeypot check
+            sim = await tx_simulator.can_sell_token(contract, dex_trader.solana_address or "")
+            if not sim["can_sell"]:
+                return False, f"Honeypot: {sim['error']}"
+            
+            # Dev selling check
+            dev_check = await dev_tracker.is_dev_selling(contract)
+            if dev_check["is_selling"]:
+                return False, f"Dev selling!"
         
-        # Calculate comprehensive score
-        score_data = await self.calculate_signal_score(coin, contract, data)
-        
-        # Require minimum score of 30
-        if score_data["total"] < 30:
-            return False, f"Low score ({score_data['total']})", score_data["total"]
-        
-        return True, " | ".join(score_data["reasons"]), score_data["total"]
+        return True, "Safe ✓"
     
-    def calculate_position_size(self, available_usdc: float, risk_score: int, signal_score: int) -> float:
+    async def is_good_buy_degen(self, coin: str, signal: dict, contract: str) -> tuple:
+        """Tier 2: Degen trade validation (pump.fun early entries)"""
+        
+        if not settings.degen_enabled:
+            return False, "Degen disabled"
+        
+        market_cap = signal.get("market_cap", 0)
+        
+        # Looser MC requirements for pump.fun
+        if market_cap < settings.degen_min_market_cap:
+            return False, f"MC too low ${market_cap:,.0f}"
+        if market_cap > settings.degen_max_market_cap:
+            return False, f"MC too high ${market_cap:,.0f} (graduated)"
+        
+        # Age check - want fresh but not brand new
+        age_min = signal.get("age_minutes", 0)
+        if age_min < 3:
+            return False, f"Too fresh ({age_min:.0f}m)"
+        if age_min > 120:
+            return False, f"Too old ({age_min:.0f}m)"
+        
+        # Dev check still applies
+        if contract:
+            dev_check = await dev_tracker.is_dev_selling(contract)
+            if dev_check["is_selling"]:
+                return False, f"Dev selling!"
+        
+        # Graduating tokens get bonus (about to hit DEX)
+        if signal.get("source") == "pumpfun_graduating":
+            return True, "🚀 Graduating!"
+        
+        return True, "Degen ✓"
+    
+    async def is_good_buy(self, coin: str, signal: dict) -> tuple:
+        """Main entry validation - routes to safe or degen"""
+        data = await self.get_token_data(coin)
+        target_chain = dex_trader.chain if dex_trader.initialized else "solana"
+        contract = data.get("contract_address") or signal.get("contract_address")
+        
+        if data["price"] == 0 and not self.is_degen_signal(signal):
+            return False, "No price data", 0, False
+        
+        if data["chain"] and data["chain"] != target_chain:
+            return False, f"Wrong chain ({data['chain']})", 0, False
+        
+        # Market correlation check
+        market = await market_correlation.check_market_conditions()
+        if not market["safe_to_buy"]:
+            return False, market["warning"], 0, False
+        
+        # Not dumping
+        if data["change_1h"] < -15:
+            return False, f"Dumping {data['change_1h']:.0f}%", 0, False
+        
+        # Route to appropriate tier
+        is_degen = self.is_degen_signal(signal)
+        
+        if is_degen:
+            is_good, reason = await self.is_good_buy_degen(coin, signal, contract)
+            signal_score = 70 if is_good else 0  # Degen gets flat score
+        else:
+            is_good, reason = await self.is_good_buy_safe(coin, signal, data, contract)
+            if is_good:
+                score_data = await self.calculate_signal_score(coin, contract, data)
+                signal_score = score_data["total"]
+                reason = " | ".join(score_data["reasons"]) if score_data["reasons"] else reason
+            else:
+                signal_score = 0
+        
+        return is_good, reason, signal_score, is_degen
+    
+    async def calculate_signal_score(self, coin: str, contract: str, data: dict) -> dict:
+        """Calculate comprehensive signal score"""
+        scores = {"base": 0, "whale": 0, "volume_spike": 0, "momentum": 0, "total": 0, "reasons": []}
+        
+        # Whale activity
+        whale_data = whale_tracker.get_whale_score(contract)
+        if whale_data["whale_count"] > 0:
+            scores["whale"] = min(whale_data["whale_count"] * 10, 25)
+            if whale_data["recent"]:
+                scores["whale"] += 10
+                scores["reasons"].append(f"🐋 {whale_data['whale_count']} whales")
+        
+        # Volume spike
+        if contract:
+            vol_data = await volume_detector.check_volume_spike(contract)
+            if vol_data["has_spike"]:
+                scores["volume_spike"] = min(int(vol_data["spike_multiplier"] * 5), 25)
+                scores["reasons"].append(f"📈 {vol_data['spike_multiplier']:.1f}x vol")
+        
+        # Momentum
+        if 5 < data["change_1h"] < 30:
+            scores["momentum"] = 15
+            scores["reasons"].append(f"🚀 +{data['change_1h']:.0f}%")
+        if data["change_5m"] > 3:
+            scores["momentum"] += 10
+        
+        # Buy pressure
+        activity = data["buys_1h"] + data["sells_1h"]
+        if activity > 0:
+            buy_ratio = data["buys_1h"] / activity
+            if buy_ratio > 0.6:
+                scores["base"] += 15
+                scores["reasons"].append(f"💪 {buy_ratio:.0%} buys")
+        
+        scores["total"] = sum([scores["base"], scores["whale"], scores["volume_spike"], scores["momentum"]])
+        return scores
+    
+    def calculate_position_size(self, available_usdc: float, risk_score: int, signal_score: int, is_degen: bool) -> float:
+        """Calculate position size based on tier"""
+        
+        if is_degen:
+            # Degen: smaller fixed size
+            return min(settings.degen_max_position_usd, available_usdc * 0.15)
+        
+        # Safe tier: dynamic sizing
         base_percent = 0.20
         
         if self.consecutive_wins >= 3:
@@ -218,7 +263,6 @@ class Trader:
         elif self.consecutive_losses >= 2:
             base_percent = 0.10
         
-        # Boost for high signal scores
         if signal_score >= 60:
             base_percent += 0.10
         
@@ -253,14 +297,17 @@ class Trader:
         elif buy_ratio < 0.4:
             risk += 15
         
-        if abs(data["change_1h"]) > 30:
-            risk += 15
-        
         return max(10, min(90, risk))
     
     async def should_smart_sell(self, position: dict, current_price: float, pnl_percent: float) -> dict:
+        """Smart exit with tier-aware targets"""
         coin = position["coin"]
         data = await self.get_token_data(coin)
+        is_degen = position.get("is_degen", False)
+        
+        # Use tier-appropriate targets
+        take_profit = settings.degen_take_profit if is_degen else settings.take_profit_percent
+        stop_loss = settings.degen_stop_loss if is_degen else settings.stop_loss_percent
         
         if coin not in self.position_highs:
             self.position_highs[coin] = pnl_percent
@@ -270,52 +317,69 @@ class Trader:
         peak = self.position_highs[coin]
         drawdown = peak - pnl_percent
         
-        if data["liquidity"] < 20000:
+        # Liquidity crisis
+        if data["liquidity"] < 10000:
             return {"should_sell": True, "reason": "⚠️ Liquidity crisis"}
         
-        if pnl_percent <= -settings.stop_loss_percent:
+        # Stop loss
+        if pnl_percent <= -stop_loss:
             return {"should_sell": True, "reason": f"Stop loss {pnl_percent:.1f}%"}
         
+        # Time stop (shorter for degen)
         open_time = position.get("open_time")
         if open_time:
             if isinstance(open_time, str):
                 open_time = datetime.fromisoformat(open_time.replace('Z', '+00:00'))
             hours_held = (datetime.now(timezone.utc) - open_time).total_seconds() / 3600
-            if hours_held > 2 and -2 < pnl_percent < 3:
-                return {"should_sell": True, "reason": f"Time stop ({hours_held:.1f}h flat)"}
+            max_hours = 1 if is_degen else 2  # Degen exits faster
+            if hours_held > max_hours and -2 < pnl_percent < 3:
+                return {"should_sell": True, "reason": f"Time stop ({hours_held:.1f}h)"}
         
-        if peak >= 20 and drawdown > 8:
+        # Trailing stops
+        if peak >= 50 and drawdown > 15:
+            return {"should_sell": True, "reason": f"Trail: +{peak:.0f}%→+{pnl_percent:.0f}%"}
+        if peak >= 20 and drawdown > 10:
             return {"should_sell": True, "reason": f"Trail: +{peak:.0f}%→+{pnl_percent:.0f}%"}
         if peak >= 10 and drawdown > 5:
             return {"should_sell": True, "reason": f"Trail: +{peak:.0f}%→+{pnl_percent:.0f}%"}
         
-        if pnl_percent >= settings.take_profit_percent:
+        # Take profit
+        if pnl_percent >= take_profit:
             return {"should_sell": True, "reason": f"Take profit +{pnl_percent:.1f}%"}
         
+        # Momentum death
         if data["change_5m"] < -10 and pnl_percent > 0:
             return {"should_sell": True, "reason": "Momentum dying"}
         
-        activity = data.get("buys_5m", 0) + data.get("sells_5m", 0)
-        if activity > 5:
-            sell_ratio = data.get("sells_5m", 0) / activity
-            if sell_ratio > 0.7 and pnl_percent > -3:
-                return {"should_sell": True, "reason": "Heavy sell pressure"}
+        # Dev selling (critical)
+        contract = position.get("contract_address")
+        if contract and dev_tracker.is_known_dev_seller(contract):
+            return {"should_sell": True, "reason": "🚨 Dev selling!"}
         
         return {"should_sell": False, "reason": ""}
+    
+    async def get_degen_exposure(self, positions: list) -> float:
+        """Calculate current $ in degen positions"""
+        total = 0
+        for pos in positions:
+            if pos.get("is_degen", False):
+                price = await self.get_current_price(pos["coin"])
+                total += price * pos.get("quantity", 0)
+        return total
     
     async def process_signals(self, signals: list):
         if not settings.trading_enabled:
             return
         if settings.is_daily_loss_limit_hit():
             print("⚠️ Daily loss limit - pausing")
-            await alert_service.alert_warning("Daily loss limit hit - trading paused")
+            await alert_service.alert_warning("Daily loss limit hit")
             return
         
         positions = await self.db.get_open_positions()
         if len(positions) >= settings.max_open_positions:
             return
         
-        # Check market conditions first
+        # Check market conditions
         market = await market_correlation.check_market_conditions()
         if not market["safe_to_buy"]:
             print(f"⚠️ Market: {market['warning']}")
@@ -324,6 +388,7 @@ class Trader:
         # Scan whale activity
         await whale_tracker.scan_whale_activity()
         
+        # Get balances
         available_usdc = 0
         if dex_trader.initialized:
             balances = await dex_trader.get_balances()
@@ -333,11 +398,21 @@ class Trader:
         if available_usdc < 0.50:
             return
         
-        # Use better signal sources
-        better_signals = await signal_sources.get_all_signals()
-        all_signals = signals + better_signals
+        # Calculate degen budget
+        total_portfolio = available_usdc + sum(
+            pos.get("buy_price", 0) * pos.get("quantity", 0) for pos in positions
+        )
+        degen_exposure = await self.get_degen_exposure(positions)
+        degen_budget = settings.get_degen_budget(total_portfolio, degen_exposure)
         
-        # Sort by signal score
+        print(f"📊 Degen budget: ${degen_budget:.2f} ({degen_exposure:.2f} deployed)")
+        
+        # Get all signals
+        better_signals = await signal_sources.get_all_signals()
+        pumpfun_signals = await pumpfun_scanner.get_all_signals() if settings.degen_enabled else []
+        all_signals = signals + better_signals + pumpfun_signals
+        
+        # Sort by score
         all_signals.sort(key=lambda x: x.get("signal_score", 0), reverse=True)
         
         for signal in all_signals[:30]:
@@ -352,22 +427,29 @@ class Trader:
             if await self.db.has_open_position(coin):
                 continue
             
-            is_good, reason, signal_score = await self.is_good_buy(coin, signal)
+            is_good, reason, signal_score, is_degen = await self.is_good_buy(coin, signal)
+            
             if not is_good:
                 print(f"⛔ {coin}: {reason}")
                 continue
             
+            # Check degen budget
+            if is_degen and degen_budget < settings.degen_max_position_usd:
+                print(f"⛔ {coin}: Degen budget exhausted")
+                continue
+            
             data = await self.get_token_data(coin)
-            price = data["price"]
+            price = data["price"] or signal.get("price", 0.0001)
             contract = data["contract_address"] or signal.get("contract_address")
             
             risk_score = self.calculate_risk_score(signal, data)
-            position_usd = self.calculate_position_size(available_usdc, risk_score, signal_score)
+            position_usd = self.calculate_position_size(available_usdc, risk_score, signal_score, is_degen)
             
             if position_usd < 0.50:
                 continue
             
-            print(f"✅ {coin} Score:{signal_score} Risk:{risk_score} | {reason}")
+            tier = "🎰 DEGEN" if is_degen else "✅ SAFE"
+            print(f"{tier} {coin} Score:{signal_score} | {reason}")
             
             if settings.live_trading and dex_trader.initialized:
                 print(f"🔄 BUY ${position_usd:.2f} {coin}")
@@ -378,20 +460,21 @@ class Trader:
                     continue
                 
                 print(f"✅ Bought!")
-                await alert_service.alert_buy(coin, position_usd, price, reason)
+                await alert_service.alert_buy(coin, position_usd, price, f"{tier} | {reason}")
             else:
                 print(f"📝 PAPER BUY: {coin}")
             
             await self.db.open_position({
                 "coin": coin,
-                "quantity": position_usd / price,
+                "quantity": position_usd / price if price > 0 else 0,
                 "buy_price": price,
                 "position_usd": position_usd,
-                "market_cap": data["market_cap"],
+                "market_cap": data.get("market_cap") or signal.get("market_cap", 0),
                 "risk_score": risk_score,
                 "signal_score": signal_score,
+                "is_degen": is_degen,
                 "contract_address": contract,
-                "chain": data["chain"],
+                "chain": data.get("chain", "solana"),
                 "signal": signal
             })
             break
@@ -452,8 +535,11 @@ class Trader:
             decision = await self.should_smart_sell(pos, current_price, pnl_percent)
             
             if decision["should_sell"]:
+                is_degen = pos.get("is_degen", False)
+                tier = "🎰" if is_degen else "📈"
+                
                 if settings.live_trading and dex_trader.initialized and contract:
-                    print(f"🔄 SELL {coin} {pnl_percent:+.1f}% - {decision['reason']}")
+                    print(f"🔄 SELL {tier} {coin} {pnl_percent:+.1f}% - {decision['reason']}")
                     result = await dex_trader.swap_token_to_usdc(contract)
                     
                     if not result["success"]:
